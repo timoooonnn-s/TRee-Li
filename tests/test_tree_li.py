@@ -86,6 +86,36 @@ class TestCsv(TempDir):
         self.assertEqual([c[1] for c in columns], ["Name", "IP", "subnet", "Alias"])
         self.assertTrue(any("comment" in w for w in warns))
 
+    def test_data_check(self):
+        p = self.write("h.csv", "Name;IP;comment\n"
+                       "sw1;10.0.0.1;ok\n"
+                       "sw2;10.0.0.1;same IP\n"
+                       "SW1;10.0.0.3;same name\n"
+                       "sw4;10.0.0.300;bad\n"
+                       "sw5;010.0.0.5;octal\n"
+                       "sw6;;no ip\n"
+                       "sw7;10.0.0.7;a;b\n")
+        report = {}
+        devices, _, _ = tl.build_devices(*tl.read_table(p, None, report), cfg=tl.load_config(args()))
+        self.assertEqual(report["lines"], [2, 3, 4, 5, 6, 7, 8])
+        issues = "\n".join(tl.data_issues(devices, report["lines"], report["issues"]))
+        for expected in ("line 8: 4 fields, the header has 3", "IP 10.0.0.1 is used 2 times",
+                         "name 'sw1' appears 2 times: lines 2, 4", "'10.0.0.300' is not a valid IPv4",
+                         "leading zeros", "line 7: 'sw6' has no IP"):
+            self.assertIn(expected, issues)
+
+    def test_export(self):
+        p = self.write("i.csv", "Name;IP;location\nsw1;10.0.0.1;Room 1\n")
+        headers, rows = tl.read_table(p)
+        devices, _, _ = tl.build_devices(headers, rows, tl.load_config(args()))
+        out = os.path.join(self.tmp, "export.csv")
+        tl.export_csv(out, devices, headers, ";", {"ping": {"10.0.0.1": "up"}, "ssh": {}}, {("ping", "10.0.0.1"): 0.0})
+        h2, r2 = tl.read_table(out)
+        self.assertEqual(h2, ["Name", "IP", "location", "Ping", "Ping checked", "SSH", "SSH checked"])
+        self.assertEqual(r2[0]["location"], "Room 1")
+        self.assertEqual(r2[0]["Ping"], "up")
+        self.assertEqual(os.stat(out).st_mode & 0o777, 0o600)
+
     def test_no_ip_column(self):
         p = self.write("g.csv", "Name;where\nsw1;x\n")
         cfg = tl.load_config(args())
@@ -222,6 +252,7 @@ class TestSearchSyntax(unittest.TestCase):
         self.assertEqual(self.names("'bc01"), [])                              # exact: not a substring
         self.assertEqual(self.names("'core ber"), ["ber-core-01"])
         self.assertEqual(self.names("-tst"), self.names(""))                   # excludes are exact
+        self.assertEqual(self.names("'"), self.names(""))                      # just started an exact term
 
     def test_fuzzy_ranking_and_marks(self):
         found = {}
@@ -278,6 +309,16 @@ class TestUserState(TempDir):
         tl.UserState(d).touch("newest")
         self.assertEqual(len(tl.UserState(d).recent), tl.UserState.MAX_RECENT)
         self.assertIn("newest", tl.UserState(d).recent)
+
+    def test_check_results_are_saved_and_merged(self):
+        d = os.path.join(self.tmp, "state")
+        tl.UserState(d).save_status({"ping": {"10.0.0.1": "up", "10.0.0.2": "wait"}, "ssh": {"10.0.0.1": "closed"}},
+                                    {("ping", "10.0.0.1"): 100, ("ssh", "10.0.0.1"): 100})
+        tl.UserState(d).save_status({"ping": {"10.0.0.1": "down"}, "ssh": {}}, {("ping", "10.0.0.1"): 50})  # older
+        status, checked = tl.UserState(d).load_status()
+        self.assertEqual(status["ping"], {"10.0.0.1": "up"})                # "wait" is never saved
+        self.assertEqual(status["ssh"], {"10.0.0.1": "closed"})
+        self.assertEqual(checked[("ping", "10.0.0.1")], 100)
 
     def test_unwritable_directory_reports_error(self):
         blocker = os.path.join(self.tmp, "file")

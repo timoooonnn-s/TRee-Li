@@ -47,9 +47,10 @@ COMMANDS = ["ssh", "ping", "traceroute", "batch ping", "details", "help", "exit"
 
 # Status words are stored, shown and searched as they are (ping:down, ssh:closed).
 PING_UP, PING_DOWN, WAIT = "up", "down", "wait"
-SSH_OPEN, SSH_CLOSED, SSH_SILENT = "open", "closed", "no answer"
+SSH_OPEN, SSH_CLOSED, SSH_SILENT = "open", "closed", "no-answer"     # one word each: searchable
 STATUS_LABELS = ["Ping", "SSH"]                         # the two status columns after the CSV columns
-STATUS_WIDTHS = [6, 11]                                 # "* down", "* no answer"
+STATUS_WIDTHS = [6, 11]                                 # "* down", "* no-answer"
+CHECKED_STATES = (PING_UP, PING_DOWN, SSH_OPEN, SSH_CLOSED, SSH_SILENT)     # results worth keeping
 STATUS_RANK = {PING_DOWN: 0, SSH_CLOSED: 0, SSH_SILENT: 1, PING_UP: 2, SSH_OPEN: 2, WAIT: 3}
 STATUS_STYLE = {PING_UP: "up", SSH_OPEN: "up", PING_DOWN: "down", SSH_CLOSED: "down",
                 SSH_SILENT: "down", WAIT: "wait"}
@@ -82,6 +83,8 @@ DEFAULTS = {
     "ssh_check_timeout": "3",
     "trace_command": "auto",
     "charset": "auto",
+    "mouse": "yes",
+    "export_dir": "~",
 }
 
 DELIMITERS = {"auto": None, "tab": "\t", "\\t": "\t", "semicolon": ";", "comma": ",", "pipe": "|"}
@@ -220,6 +223,8 @@ def load_config(args):
     if charset not in ("auto", "unicode", "ascii"):
         raise ConfigError("charset: use auto, unicode or ascii")
     cfg.charset_setting = charset
+    cfg.mouse = parse_bool(raw["mouse"], "mouse")
+    cfg.export_dir = os.path.abspath(os.path.expanduser(raw["export_dir"] or "~"))
     return cfg
 
 
@@ -258,9 +263,10 @@ def detect_delimiter(header_line):
     return best
 
 
-def read_table(path, delimiter=None):
+def read_table(path, delimiter=None, report=None):
     """Return (headers, rows); every row is a dict header -> cleaned value.
-    Blank lines and lines starting with '#' are ignored."""
+    Blank lines and lines starting with '#' are ignored.  If report is a dict it
+    receives the delimiter used, the CSV line of every row and field-count problems."""
     if not os.path.isfile(path):
         hint = ""
         if os.path.isfile(os.path.join(SCRIPT_DIR, "data.example.csv")):
@@ -270,8 +276,11 @@ def read_table(path, delimiter=None):
     first = next((line for line in text.splitlines() if line.strip()), None)
     if first is None:
         raise DataError("switch list is empty: %s" % path)
-    reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter or detect_delimiter(first))
+    delimiter = delimiter or detect_delimiter(first)
+    reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter)
     headers, rows = None, []
+    report = {} if report is None else report
+    report.update(delimiter=delimiter, lines=[], issues=[])
     try:
         for record in reader:
             if not any(cell.strip() for cell in record) or record[0].lstrip().startswith("#"):
@@ -286,6 +295,11 @@ def read_table(path, delimiter=None):
                     headers.append(h)
                 continue
             rows.append(dict((h, clean(record[i]) if i < len(record) else "") for i, h in enumerate(headers)))
+            report["lines"].append(reader.line_num)
+            if len(record) != len(headers):
+                report["issues"].append("line %d: %d fields, the header has %d%s" % (
+                    reader.line_num, len(record), len(headers),
+                    " (a '%s' inside a value?)" % delimiter if len(record) > len(headers) else ""))
     except csv.Error as e:
         raise DataError("%s, line %d: %s" % (path, reader.line_num, e))
     if headers is None:
@@ -339,6 +353,52 @@ def build_devices(headers, rows, cfg):
         d.search = "\x00".join(d.lcells)          # \x00: a word never matches across two columns
         devices.append(d)
     return devices, columns, warns
+
+
+IPV4_LIKE = re.compile(r"^[0-9.]+$")
+
+
+def data_issues(devices, lines, issues=()):
+    """Plausibility checks for the switch list -> warnings with CSV line numbers."""
+    out = list(issues)
+    names, hosts = {}, {}
+    for d, line in zip(devices, lines):
+        if not d.host:
+            out.append("line %d: '%s' has no IP" % (line, d.name))
+        elif not valid_host(d.host):
+            out.append("line %d: '%s' has an unusable IP/host '%s'" % (line, d.name, d.host))
+        elif IPV4_LIKE.match(d.host):
+            parts = d.host.split(".")
+            if len(parts) != 4 or not all(p and int(p) <= 255 for p in parts):
+                out.append("line %d: '%s' - '%s' is not a valid IPv4 address" % (line, d.name, d.host))
+            elif any(len(p) > 1 and p.startswith("0") for p in parts):
+                out.append("line %d: '%s' - '%s' has leading zeros (ping may read them as octal)"
+                           % (line, d.name, d.host))
+        names.setdefault(d.name.lower(), []).append(line)
+        if d.host:
+            hosts.setdefault(d.host, []).append("%s (line %d)" % (d.name, line))
+    for name, where in names.items():
+        if len(where) > 1:
+            out.append("name '%s' appears %d times: lines %s" % (name, len(where), ", ".join(map(str, where))))
+    for host, who in hosts.items():
+        if len(who) > 1:
+            out.append("IP %s is used %d times: %s" % (host, len(who), ", ".join(who)))
+    return out
+
+
+def export_csv(path, devices, headers, delimiter, status, checked):
+    """Write devices (all CSV columns + ping/SSH result and time) to a new file, mode 0600."""
+    def when(kind, host):
+        stamp = checked.get((kind, host))
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp)) if stamp else ""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8-sig", newline="") as f:     # BOM: Excel opens it right
+        writer = csv.writer(f, delimiter=delimiter)
+        writer.writerow(list(headers) + ["Ping", "Ping checked", "SSH", "SSH checked"])
+        for d in devices:
+            writer.writerow([d.values.get(h, "") for h in headers] + [
+                status["ping"].get(d.host, ""), when("ping", d.host),
+                status["ssh"].get(d.host, ""), when("ssh", d.host)])
 
 
 def device_key(d):
@@ -436,6 +496,8 @@ def filter_devices(devices, query, fields=None, status=None, favorites=(), recen
     If found is a dict, it receives device -> (score, {column: positions}) for fuzzy words."""
     tests = []
     for token in query.lower().split():
+        if token in ("'", "-", "-'"):                # just started typing a term: no filter yet
+            continue
         negate = len(token) > 1 and token.startswith("-")
         if negate:
             token = token[1:]
@@ -541,6 +603,33 @@ class UserState(object):
         self._write("favorites", sorted(self.favorites))
         return key in self.favorites
 
+    def load_status(self):
+        """Saved ping / SSH results: ({"ping": {...}, "ssh": {...}}, {(kind, host): time})."""
+        status, checked = {"ping": {}, "ssh": {}}, {}
+        for line in self._read("status"):
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) == 4 and parts[1] in status and parts[2] in CHECKED_STATES:
+                host, kind, state, stamp = parts
+                try:
+                    stamp = float(stamp)
+                except ValueError:
+                    continue
+                if stamp >= checked.get((kind, host), 0):
+                    status[kind][host], checked[(kind, host)] = state, stamp
+        return status, checked
+
+    def save_status(self, status, checked):
+        """Merge our results into the saved ones (newest wins, another TRee-Li may
+        have checked other switches meanwhile) and write them back."""
+        saved, saved_checked = self.load_status()
+        for kind, states in status.items():
+            for host, state in states.items():
+                stamp = checked.get((kind, host), 0)
+                if state in CHECKED_STATES and stamp >= saved_checked.get((kind, host), 0):
+                    saved[kind][host], saved_checked[(kind, host)] = state, stamp
+        self._write("status", ["%s\t%s\t%s\t%d" % (host, kind, state, saved_checked.get((kind, host), 0))
+                               for kind in ("ping", "ssh") for host, state in sorted(saved[kind].items())])
+
     def touch(self, key):
         self.load()
         self.recent[key] = time.time()
@@ -638,38 +727,104 @@ def ping_once(host, timeout):
         return False
 
 
+def resolve(host, port, timeout):
+    """getaddrinfo with a time limit - it has none of its own (slow DNS would block)."""
+    result = []
+
+    def run():
+        try:
+            result.append(socket.getaddrinfo(host, port, type=socket.SOCK_STREAM))
+        except (OSError, UnicodeError):
+            result.append([])
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    t.join(timeout)
+    return result[0] if result else []
+
+
+def _ssh_greeting(conn, deadline):
+    """Wait for the server's "SSH-" line; other lines may come first (RFC 4253 4.2).
+    If the server stays quiet for half the time, greet it first."""
+    data, greeted = b"", False
+    while len(data) < 4096:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        conn.settimeout(remaining if greeted else remaining / 2)
+        try:
+            chunk = conn.recv(1024)
+        except socket.timeout:
+            if greeted:
+                break
+            conn.sendall(b"SSH-2.0-TRee-Li_check\r\n")
+            greeted = True
+            continue
+        if not chunk:
+            break
+        data += chunk
+        if any(line.startswith(b"SSH-") for line in data.split(b"\n")):
+            return SSH_OPEN
+    return SSH_SILENT
+
+
 def ssh_check(host, port, timeout):
-    """Does an SSH server answer?  Connects and waits for its "SSH-" greeting -
-    no login, no password.  Returns SSH_OPEN, SSH_CLOSED or SSH_SILENT."""
+    """Does an SSH server answer?  Connects and waits for its "SSH-" greeting - no login,
+    no password.  Everything (DNS, connect, greeting) together takes at most timeout
+    seconds.  Returns SSH_OPEN, SSH_CLOSED or SSH_SILENT."""
+    deadline = time.time() + timeout
+    refused = False
+    for family, kind, proto, _, address in resolve(host, port, timeout):
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        conn = socket.socket(family, kind, proto)
+        try:
+            conn.settimeout(remaining)
+            conn.connect(address)
+            return _ssh_greeting(conn, deadline)
+        except ConnectionRefusedError:
+            refused = True
+        except OSError:
+            pass
+        finally:
+            conn.close()
+    return SSH_CLOSED if refused else SSH_SILENT
+
+
+def ssh_port_for(cfg, host):
+    """The port ssh itself will use (ssh_options -p, ~/.ssh/config Port), asked with
+    `ssh -G`, which only prints the configuration.  Falls back to cfg.ssh_port."""
     try:
-        with socket.create_connection((host, port), timeout=timeout) as conn:
-            try:
-                greeting = conn.recv(64)
-            except socket.timeout:              # some servers wait for the client to speak first
-                conn.sendall(b"SSH-2.0-TRee-Li_check\r\n")
-                greeting = conn.recv(64)
-        return SSH_OPEN if greeting.startswith(b"SSH-") else SSH_SILENT
-    except ConnectionRefusedError:
-        return SSH_CLOSED
-    except (OSError, ValueError):               # timeout, unreachable, unknown name
-        return SSH_SILENT
+        out = subprocess.run(list(cfg.ssh_command) + list(cfg.ssh_options) + ["-G", "--", host],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=5).stdout
+        m = re.search(rb"^port (\d+)\s*$", out, re.MULTILINE)
+        if m:
+            return int(m.group(1))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return cfg.ssh_port
 
 
 class BatchCheck(object):
-    """Pings and SSH-checks many hosts with a bounded number of worker threads."""
+    """Pings and SSH-checks many hosts with a bounded number of worker threads.
+    kinds: ("ping", "ssh"), or ("ssh",) when ping is not installed."""
 
-    def __init__(self, hosts, cfg, ping_states, ssh_states):
-        self.cfg = cfg
-        self.states = {"ping": ping_states, "ssh": ssh_states}
-        self.tasks = [(h, kind) for h in hosts for kind in ("ping", "ssh")]
-        self.hosts = len(hosts)
+    def __init__(self, hosts, cfg, status, checked, kinds=("ping", "ssh")):
+        self.cfg, self.states, self.checked = cfg, status, checked
+        self.tasks = [(h, kind) for h in hosts for kind in kinds]
         self.done = 0
         self.counts = {}
         self.cancelled = self.reported = False
+        self.previous = {}                       # results from before, restored on cancel
         self._next = 0
         self._lock = threading.Lock()
-        for h in hosts:
-            ping_states[h] = ssh_states[h] = WAIT
+        for host, kind in self.tasks:
+            old = status[kind].get(host)
+            if old in CHECKED_STATES:
+                self.previous[(kind, host)] = old
+            status[kind][host] = WAIT
         self.threads = [threading.Thread(target=self._work) for _ in range(min(cfg.ping_workers, len(self.tasks)))]
         for t in self.threads:
             t.daemon = True
@@ -686,9 +841,10 @@ class BatchCheck(object):
             if kind == "ping":
                 result = PING_UP if ping_once(host, cfg.ping_timeout) else PING_DOWN
             else:
-                result = ssh_check(host, cfg.ssh_port, cfg.ssh_check_timeout)
+                result = ssh_check(host, ssh_port_for(cfg, host), cfg.ssh_check_timeout)
             with self._lock:
                 self.states[kind][host] = result
+                self.checked[(kind, host)] = time.time()
                 self.counts[result] = self.counts.get(result, 0) + 1
                 self.done += 1
 
@@ -702,7 +858,7 @@ class BatchCheck(object):
 
     def summary(self):
         c = self.counts
-        return "ping %d up, %d down / ssh %d open, %d closed, %d no answer" % (
+        return "ping %d up, %d down / ssh %d open, %d closed, %d no-answer" % (
             c.get(PING_UP, 0), c.get(PING_DOWN, 0), c.get(SSH_OPEN, 0), c.get(SSH_CLOSED, 0), c.get(SSH_SILENT, 0))
 
     def cancel(self):
@@ -710,14 +866,18 @@ class BatchCheck(object):
             self.cancelled = True
             for host, kind in self.tasks[self._next:]:
                 if self.states[kind].get(host) == WAIT:
-                    del self.states[kind][host]
+                    old = self.previous.get((kind, host))
+                    if old:
+                        self.states[kind][host] = old
+                    else:
+                        del self.states[kind][host]
 
 
 class ProcStream(object):
     """Runs a command in a pseudo-terminal (so its output is line buffered)
     and collects the output lines in a background thread."""
 
-    def __init__(self, argv):
+    def __init__(self, argv, env=None):
         self.lines = ["$ " + " ".join(shlex.quote(a) for a in argv), ""]
         self.partial = ""
         self.done = False
@@ -728,7 +888,7 @@ class ProcStream(object):
         try:
             master, slave = pty.openpty()
             self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=slave, stderr=slave,
-                                         start_new_session=True)
+                                         start_new_session=True, env=env)
         except OSError as e:
             for fd in (master, slave):
                 if fd is not None:
@@ -1064,8 +1224,12 @@ CURSES_KEYS = {
     curses.KEY_PPAGE: "PGUP", curses.KEY_NPAGE: "PGDN", curses.KEY_HOME: "HOME", curses.KEY_END: "END",
     curses.KEY_FIND: "HOME", curses.KEY_SELECT: "END", curses.KEY_ENTER: "ENTER",
     curses.KEY_BACKSPACE: "BACKSPACE", curses.KEY_DC: "DELETE", curses.KEY_BTAB: "BTAB",
-    curses.KEY_RESIZE: "RESIZE",
+    curses.KEY_RESIZE: "RESIZE", curses.KEY_MOUSE: "MOUSE",
 }
+MOUSE = {"event": None}           # the last mouse event (x, y, buttons), read by read_key
+WHEEL_UP = getattr(curses, "BUTTON4_PRESSED", 0)
+WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED", 0)   # only with ncurses mouse version 2 (RHEL 8+)
+CLICK, DOUBLE_CLICK = curses.BUTTON1_CLICKED, curses.BUTTON1_DOUBLE_CLICKED
 for _n in range(1, 13):
     CURSES_KEYS[curses.KEY_F0 + _n] = "F%d" % _n
 
@@ -1105,6 +1269,12 @@ def read_key(win, timeout_ms):
     except curses.error:
         return None
     if isinstance(ch, int):
+        if ch == curses.KEY_MOUSE:
+            try:
+                _, x, y, _, buttons = curses.getmouse()
+                MOUSE["event"] = (x, y, buttons)
+            except curses.error:
+                return None
         return CURSES_KEYS.get(ch)
     if ch == "\x1b":
         seq = ""
@@ -1341,6 +1511,9 @@ class App(object):
         self.sort_col, self.sort_desc = None, False
         self.ping = {}                 # host -> PING_UP / PING_DOWN / WAIT
         self.ssh = {}                  # host -> SSH_OPEN / SSH_CLOSED / SSH_SILENT / WAIT
+        self.checked = {}              # (kind, host) -> time of that ping / SSH result
+        self.headers, self.delimiter, self.issues = [], ";", []
+        self.spans = {"tabs": [], "head": [], "y_tabs": -1, "y_head": -1, "y_body": -1}   # for mouse clicks
         self.found = {}                # device -> (score, {column: positions}) of fuzzy words
         self.batch = None
         self.creds = None              # (user, password or None) - memory only
@@ -1350,9 +1523,16 @@ class App(object):
         self.msg, self.msg_error, self.msg_until = "", False, 0
         self.load_error = None
         self.set_cursor(False)
+        saved, self.checked = self.state.load_status()          # results of the last check
+        self.ping, self.ssh = saved["ping"], saved["ssh"]
+        self.mouse(True)
         self.load()
         if self.state.error:
             self.message(self.state.error, error=True, seconds=15)
+        elif self.checked and not self.load_error and not self.issues:
+            last = max(self.checked.values())
+            self.message("Ping / SSH results from the last check (%s) - batch ping refreshes them"
+                         % time.strftime("%Y-%m-%d %H:%M", time.localtime(last)), seconds=8)
 
     # -- helpers ------------------------------------------------------------
 
@@ -1376,10 +1556,29 @@ class App(object):
     def status(self):
         return [self.ping, self.ssh]
 
+    def mouse(self, on):
+        if not self.cfg.mouse:
+            return
+        try:
+            curses.mousemask((CLICK | DOUBLE_CLICK | WHEEL_UP | WHEEL_DOWN) if on else 0)
+            curses.mouseinterval(300)          # ms between two clicks of a double-click
+        except curses.error:
+            pass
+
+    def set_status(self, kind, host, state):
+        {"ping": self.ping, "ssh": self.ssh}[kind][host] = state
+        self.checked[(kind, host)] = time.time()
+
+    def save_status(self):
+        self.state.save_status({"ping": self.ping, "ssh": self.ssh}, self.checked)
+        if self.state.error:
+            self.message(self.state.error, error=True, seconds=10)
+
     def load(self):
         keep = self.selected()
         try:
-            headers, rows = read_table(self.cfg.data, self.cfg.delimiter)
+            report = {}
+            headers, rows = read_table(self.cfg.data, self.cfg.delimiter, report)
             devices, columns, warns = build_devices(headers, rows, self.cfg)
         except DataError as e:
             self.load_error = str(e)
@@ -1392,8 +1591,13 @@ class App(object):
             self.loaded = devices          # CSV order, used when sorting is switched off
             self.fields = dict((h.lower(), h) for h in headers)
             self.fields.update((label.lower(), h) for h, label in columns)
+            self.headers, self.delimiter = headers, report["delimiter"]
+            self.issues = data_issues(devices, report["lines"], report["issues"])
             if warns:
                 self.message("; ".join(warns), error=True, seconds=15)
+            elif self.issues:
+                self.message("%d warning%s in the switch list - run: tree-li --check"
+                             % (len(self.issues), "" if len(self.issues) == 1 else "s"), error=True, seconds=15)
         self.widths = [min(40, max([len(label) + 2] + [len(d.cells[i]) for d in self.devices]))
                        for i, (_, label) in enumerate(self.columns)]
         self.widths += STATUS_WIDTHS
@@ -1522,19 +1726,25 @@ class App(object):
             if not self.query:
                 batch += " %s ESC cancels" % sym["sep"]
         hints = [("Enter", "run"), (sym["lr"], "command"), ("^F", "favourite"),
-                 ("F1-F%d" % self.ncols(), "sort"), ("^R", "reload"), ("^C", "quit")]
+                 ("F1-F%d" % self.ncols(), "sort"), ("^E", "export"), ("^R", "reload"), ("^C", "quit")]
         self.draw_frame("Switch Manager", right, hints=hints, footer_right=batch, footer_attr=th.wait)
 
         # command tabs
+        spans = self.spans
+        spans.update(tabs=[], head=[], y_tabs=y_tabs, y_head=y_head, y_body=y_head + 2)
         if 2 + sum(len(c) + 3 for c in COMMANDS) <= w:
             x = 2
             for i, name in enumerate(COMMANDS):
                 put(scr, y_tabs, x, " %s " % name, th.tab_active if i == self.cmd else th.tab)
+                spans["tabs"].append((x, x + len(name) + 2, i))
                 x += len(name) + 3
         else:                                       # narrow terminal: only the selected command
+            n, name = len(COMMANDS), COMMANDS[self.cmd]
             put(scr, y_tabs, 2, sym["lt"], th.tab)
-            put(scr, y_tabs, 4, " %s " % COMMANDS[self.cmd], th.tab_active)
-            put(scr, y_tabs, 7 + len(COMMANDS[self.cmd]), sym["gt"], th.tab)
+            put(scr, y_tabs, 4, " %s " % name, th.tab_active)
+            put(scr, y_tabs, 7 + len(name), sym["gt"], th.tab)
+            spans["tabs"] = [(1, 4, (self.cmd - 1) % n), (4, 6 + len(name), self.cmd),
+                             (6 + len(name), 9 + len(name), (self.cmd + 1) % n)]
 
         # search: "-" and "field:" parts of terms are highlighted
         put(scr, y_search, 2, sym["prompt"], th.prompt)
@@ -1565,6 +1775,7 @@ class App(object):
         for i, label in enumerate(labels):
             label = label.upper()
             put(scr, y_head, x, fit(label, widths[i], sym["more"]), th.head)
+            spans["head"].append((x, x + widths[i] + 1, i))
             if i == self.sort_col and len(label) + 2 <= widths[i]:
                 put(scr, y_head, x + len(label) + 1, sym["down"] if self.sort_desc else sym["up"], th.sort)
             x += widths[i] + 2
@@ -1608,6 +1819,8 @@ class App(object):
                 shown = fit(value, widths[i], sym["more"])
                 put(scr, y, x, shown, th.sel if sel else th.text)
                 visible = len(value) if len(value) <= widths[i] else widths[i] - 1
+                if len(d.lcells[i]) != len(value):     # lower() changed the length: positions unreliable
+                    visible = 0
                 for pos in marks.get(i, ()):           # letters that matched the search
                     if pos < visible:
                         put(scr, y, x + pos, value[pos], th.match_sel if sel else th.match)
@@ -1639,6 +1852,7 @@ class App(object):
                 self.batch.reported = True
                 if not self.batch.cancelled:
                     self.message("Batch ping done: %s" % self.batch.summary(), seconds=20)
+                self.save_status()
                 self.status_changed()
             self.draw()
             key = read_key(self.scr, 250)
@@ -1647,6 +1861,7 @@ class App(object):
             if self.handle(key) is False:
                 if self.batch:
                     self.batch.cancel()
+                self.mouse(False)
                 return
 
     def handle(self, key):
@@ -1704,6 +1919,10 @@ class App(object):
                 else:
                     self.message("%s %s favourites" % (dev.name, "added to" if added else "removed from"))
                 self.refilter(dev)
+        elif key == "CTRL_E":
+            self.export()
+        elif key == "MOUSE":
+            return self.click()
         elif key == "CTRL_R":
             self.load()
             if not self.load_error:
@@ -1714,6 +1933,49 @@ class App(object):
             self.query += key
             self.refilter()
         return None
+
+    def click(self):
+        """Mouse: click a tab / row to select it, double-click to run, click a column
+        header to sort, wheel to scroll."""
+        if not MOUSE["event"]:
+            return None
+        x, y, buttons = MOUSE["event"]
+        spans, n = self.spans, len(self.view)
+        if buttons & WHEEL_UP:
+            self.cursor = max(0, self.cursor - 3)
+        elif buttons & WHEEL_DOWN:
+            self.cursor = min(max(0, n - 1), self.cursor + 3)
+        elif buttons & (CLICK | DOUBLE_CLICK):
+            double = buttons & DOUBLE_CLICK
+            if y == spans["y_tabs"]:
+                for x0, x1, i in spans["tabs"]:
+                    if x0 <= x < x1:
+                        self.cmd = i
+                        return self.execute() if double else None
+            elif y == spans["y_head"]:
+                for x0, x1, i in spans["head"]:
+                    if x0 <= x < x1:
+                        self.set_sort(i)
+            elif spans["y_body"] <= y < spans["y_body"] + self.body_h and self.top + y - spans["y_body"] < n:
+                self.cursor = self.top + y - spans["y_body"]
+                if double:
+                    return self.execute()
+        return None
+
+    def export(self):
+        """Ctrl-E: the current list (filter + order) with all CSV columns and the
+        ping / SSH results to a new CSV file."""
+        if not self.view:
+            self.message("Nothing to export", error=True)
+            return
+        path = os.path.join(self.cfg.export_dir, "tree-li-export-%s.csv" % time.strftime("%Y%m%d-%H%M%S"))
+        try:
+            export_csv(path, self.view, self.headers, self.delimiter,
+                       {"ping": self.ping, "ssh": self.ssh}, self.checked)
+        except OSError as e:
+            self.message("Export failed: %s" % (e.strerror or e), error=True, seconds=10)
+            return
+        self.message("Exported %d switches to %s" % (len(self.view), path), seconds=15)
 
     def execute(self):
         command = COMMANDS[self.cmd]
@@ -1735,12 +1997,16 @@ class App(object):
         if command == "ssh":
             self.connect(dev)
         elif command == "ping":
-            stream = ProcStream(ping_argv(dev.host, 4, max(2, self.cfg.ping_timeout)))
+            stream = ProcStream(ping_argv(dev.host, 4, max(2, self.cfg.ping_timeout)),
+                                env=dict(os.environ, LC_ALL="C"))      # predictable English output
             self.show_text("ping %s (%s)" % (dev.name, dev.host), stream=stream)
-            if any(" bytes from " in line for line in stream.snapshot()):
-                self.ping[dev.host] = PING_UP          # also when closed before ping finished
-            elif stream.done:
-                self.ping[dev.host] = PING_DOWN
+            if stream.done:
+                self.set_status("ping", dev.host, PING_UP if stream.returncode == 0 else PING_DOWN)
+            elif any(" bytes from " in line for line in stream.snapshot()):
+                self.set_status("ping", dev.host, PING_UP)   # closed early, but a reply came back
+            else:
+                return None
+            self.save_status()
             self.status_changed(dev)
         elif command == "traceroute":
             argv = trace_argv(self.cfg, dev.host)
@@ -1754,12 +2020,10 @@ class App(object):
     # -- batch ping ---------------------------------------------------------
 
     def start_batch(self):
-        if self.batch and self.batch.running:
+        if self.batch and self.batch.running and not self.batch.cancelled:
             self.message("Batch ping is already running (ESC with an empty search cancels it)")
             return
-        if not which("ping"):
-            self.message("'ping' is not installed", error=True)
-            return
+        kinds = ("ping", "ssh") if which("ping") else ("ssh",)
         hosts, seen = [], set()
         for d in self.view:
             if valid_host(d.host) and d.host not in seen:
@@ -1768,8 +2032,11 @@ class App(object):
         if not hosts:
             self.message("No switches to ping", error=True)
             return
-        self.batch = BatchCheck(hosts, self.cfg, self.ping, self.ssh)
-        self.message("Batch ping started for %d switches (ping + SSH port %d)" % (len(hosts), self.cfg.ssh_port))
+        self.batch = BatchCheck(hosts, self.cfg, {"ping": self.ping, "ssh": self.ssh}, self.checked, kinds)
+        if "ping" in kinds:
+            self.message("Batch ping started for %d switches (ping + SSH)" % len(hosts))
+        else:
+            self.message("'ping' is not installed - checking SSH only (%d switches)" % len(hosts), error=True)
 
     # -- popups -------------------------------------------------------------
 
@@ -1818,8 +2085,16 @@ class App(object):
                 scr.refresh()
 
                 key = read_key(scr, 150)
+                if key == "MOUSE" and MOUSE["event"]:
+                    buttons = MOUSE["event"][2]
+                    key = "WHEEL_UP" if buttons & WHEEL_UP else "WHEEL_DOWN" if buttons & WHEEL_DOWN else None
                 if key in ("ESC", "ENTER", "q", "Q"):
                     break
+                elif key == "WHEEL_UP":
+                    offset, follow = offset - 3, False
+                elif key == "WHEEL_DOWN":
+                    offset += 3
+                    follow = stream is not None and offset >= max_off
                 elif key == "UP":
                     offset, follow = offset - 1, False
                 elif key == "DOWN":
@@ -1843,9 +2118,14 @@ class App(object):
     def show_details(self, dev):
         th = self.th
         last = self.state.recent.get(device_key(dev))
+
+        def result(kind, states):
+            stamp = self.checked.get((kind, dev.host))
+            text = states.get(dev.host, "not checked")
+            return text + ("   (%s)" % time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp)) if stamp else "")
         values = list(dev.values.items()) + [
-            ("Ping", self.ping.get(dev.host, "not checked")),
-            ("SSH port %d" % self.cfg.ssh_port, self.ssh.get(dev.host, "not checked")),
+            ("Ping", result("ping", self.ping)),
+            ("SSH", result("ssh", self.ssh)),
             ("Favourite", "yes" if device_key(dev) in self.state.favorites else "no"),
             ("Last connected", time.strftime("%Y-%m-%d %H:%M", time.localtime(last)) if last else "never"),
         ]
@@ -1874,6 +2154,8 @@ class App(object):
         item("Backspace  Ctrl-W  Ctrl-U", "delete a character / word / the whole search")
         item("ESC", "clear the search, then: cancel batch ping, then: clear the sort")
         item("Ctrl-F", "mark / unmark the switch as favourite (*)")
+        item("Ctrl-E", "export the current list to CSV (%s)" % self.cfg.export_dir)
+        item("mouse", "click: select, double-click: run, header: sort, wheel: scroll")
         item("F1..F%d" % self.ncols(), "sort by column: press again for reverse, a third time for off")
         item("Tab  Shift-Tab", "next / previous sort column, then off")
         item("Ctrl-R", "reload the switch list")
@@ -1884,8 +2166,8 @@ class App(object):
         item("type:core  responsible:timmy", "a CSV column, also ones not shown in the table")
         item("location:", "column is empty")
         item("-test  -type:edge", "exclude (exact)")
-        item("ping:down  ssh:closed", "state: up/down, open/closed/no answer, wait, none")
-        item("is:fav", "your favourites (always listed first)")
+        item("ping:down  ssh:closed", "state: up/down, open/closed/no-answer, wait, none")
+        item("is:fav", "your favourites")
         item("is:recent", "switches you connected to, newest first")
         section("Commands")
         item("ssh", "connect - user/password are asked once and kept")
@@ -2052,6 +2334,7 @@ class App(object):
     def run_ssh(self, dev, user, password):
         out = sys.stdout.fileno()
         key_removed = False
+        self.mouse(False)                  # the switch session gets the plain terminal
         curses.endwin()
         try:
             while True:
@@ -2094,6 +2377,7 @@ class App(object):
             self.resume_curses()
 
     def resume_curses(self):
+        self.mouse(True)
         self.scr.keypad(True)
         curses.flushinp()
         self.sync_size()
@@ -2112,17 +2396,17 @@ def check(cfg):
     print("config files : %s" % (", ".join(cfg.files) or "none (defaults)"))
     print("switch list  : %s" % cfg.data)
     try:
-        headers, rows = read_table(cfg.data, cfg.delimiter)
+        report = {}
+        headers, rows = read_table(cfg.data, cfg.delimiter, report)
         devices, columns, warns = build_devices(headers, rows, cfg)
         print("switches     : %d" % len(devices))
         print("columns      : %s" % ", ".join("%s (%s)" % c for c in columns))
-        bad = [d for d in devices if not valid_host(d.host)]
-        for d in bad[:10]:
-            print("  warning: '%s' has no usable IP/host ('%s')" % (d.name, d.host))
-        if len(bad) > 10:
-            print("  ... and %d more without usable IP/host" % (len(bad) - 10))
-        for w in warns:
+        issues = warns + data_issues(devices, report["lines"], report["issues"])
+        print("data check   : %s" % ("ok" if not issues else "%d warning(s)" % len(issues)))
+        for w in issues[:50]:
             print("  warning: %s" % w)
+        if len(issues) > 50:
+            print("  ... and %d more" % (len(issues) - 50))
     except DataError as e:
         print("  ERROR: %s" % e)
         ok = False

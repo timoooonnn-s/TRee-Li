@@ -24,16 +24,18 @@
 ## Milestone 1d: transport without GitHub. DONE (2026-10-02)
 - [x] `tools/make-bundle.py` -> one self-extracting text file (checksum, safe paths, keeps data.csv / tree-li.conf, survives CRLF)
 
+## Milestone 1e: review round 3 + data check, export, saved results, mouse. DONE (2026-10-02)
+
 ## Milestone 2: field test (needs the user)
-- [ ] Run `./tree-li --check` on the RHEL server
-- [ ] ssh into a real Extreme Fabric Engine switch: password prompt detected? logout returns to the menu?
-- [ ] Try a wrong password once: one attempt only, then asked again
-- [ ] Try it from PuTTY (F-keys, colours, Unicode lines) and from Tabby
-- [ ] Batch ping over all ~700 switches: duration acceptable?
+- [x] `./tree-li --check` on the RHEL server: works (2026-10-02)
+- [x] ssh into a real Extreme Fabric Engine switch: password prompt detected, logout returns to the menu
+- [x] Wrong password: one attempt only, then asked again
+- [x] Dead host: ssh gives up after `connect_timeout`, then back in the menu (user likes it)
+- [ ] PuTTY (F-keys, colours, Unicode lines, mouse + Shift-select) and Tabby: not tested yet
+- [ ] Batch ping + SSH check over all ~700 switches: waiting for the full inventory
 
 ## Backlog (brainstorm, not yet chosen)
 - #3 tmux: ssh in new tmux windows (needs a private password hand-over socket)
-- #4 data checks in `--check` + startup hint (duplicates, column count, invalid IPs)
 - #5 wrong-IP warning (prompt hostname vs CSV name)
 - #6/#7 run show commands on many switches / config backup (read-only by default)
 - #8 LLDP neighbours, #9 live monitor, #10 idle password timeout, #11 personal connection log

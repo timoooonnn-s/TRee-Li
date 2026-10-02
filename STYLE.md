@@ -22,7 +22,7 @@ The code side lives in `PALETTE` in `tree-li`. This page is the reference for bo
 |---|---|---|
 | **Highlight Orange** | 214 `#ffaf00` | favourite star `*` |
 | Up | 78 `#5fd787` | `● up`, `● open` |
-| Down | 203 `#ff5f5f` | `● down`, `● closed`, `● no answer`, errors |
+| Down | 203 `#ff5f5f` | `● down`, `● closed`, `● no-answer`, errors |
 | Wait | 179 `#d7af5f` | `● wait`, "running" |
 
 ## Rules

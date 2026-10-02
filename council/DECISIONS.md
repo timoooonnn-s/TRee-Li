@@ -98,3 +98,22 @@ The command is `tree-li` (`tree` already exists on Linux, so the hyphenated name
   - Ping and SSH run as separate tasks in the same worker pool, so a host with ICMP filtered can still show `ssh open`.
   - `ssh:no` matches "no answer" but not unchecked hosts (`none`), because status filters treat `none` specially (*Critic*).
 - Sorting by PING/SSH puts problems first.
+
+## D17: Review round 3 + data check, export, saved results, mouse (2026-10-02)
+- **Fixes:**
+  - Single ping: a finished ping counts by its exit code, and runs with `LC_ALL=C`. On a German server " bytes from " didn't match, so every ping showed "down".
+  - SSH check: accepts pre-banner lines (RFC 4253) and uses one overall deadline, including a time-limited DNS lookup.
+  - The SSH port comes from `ssh -G` (`ssh_options`, `~/.ssh/config`).
+  - A cancelled batch restores earlier results and doesn't block a new batch. Without `ping`, the batch checks SSH only.
+  - A lone `'` or `-` while typing is ignored.
+  - The state is `no-answer`, one word, so it's searchable.
+  - Highlighting is skipped when lower-casing changes a cell's length. Dead `BatchCheck.hosts` removed.
+- **Bundle (*Warden*):** only git-tracked files are packed. Untracked files are listed and never shipped. Without git, an allow-list is used.
+- **Data check:** field-count mismatches with line numbers, duplicate names and IPs, missing or invalid IPs, leading zeros. Shown in `--check`, plus a hint at startup.
+- **Export (`Ctrl-E`):** the current view with all CSV columns plus Ping/SSH and their times, to a new file (0600, UTF-8 with BOM for Excel, the list's own delimiter) in `export_dir` (default `~`).
+- **Saved check results:** `~/.local/state/tree-li/status`, merged per host (newest wins), restored at startup with a hint. `wait` is never saved.
+- **Mouse** (stdlib curses, on by default, `mouse = no` to switch off):
+  - click selects, double-click runs (300 ms window), a header click sorts, the wheel scrolls
+  - switched off during ssh sessions
+  - *Operator:* text selection then needs Shift; documented in the README troubleshooting table
+  - wheel-down needs ncurses mouse v2 (RHEL 8+); older builds only scroll up

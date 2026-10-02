@@ -47,7 +47,7 @@ cp data.example.csv data.csv
 ```
 
 Then put your switches into `data.csv`: one line per switch, at least `Name` and `IP`
-([format](#switch-list-datacsv)). Check it with:
+([format](#switch-list-datacsv)). Check it, including a [data check](#data-check) for duplicates and typos:
 
 ```bash
 ./tree-li --check
@@ -84,6 +84,9 @@ All keys: [Keys](#keys) or the **help** command inside TRee-Li. If something loo
 - [Commands](#commands)
 - [Search](#search)
 - [Favourites and recent switches](#favourites-and-recent-switches)
+- [Saved check results](#saved-check-results)
+- [Export](#export)
+- [Data check](#data-check)
 - [Switch list (`data.csv`)](#switch-list-datacsv)
 - [Configuration](#configuration)
 - [Team setup](#team-setup)
@@ -106,7 +109,7 @@ All keys: [Keys](#keys) or the **help** command inside TRee-Li. If something loo
 
     NAME          IP            SUBNET    ALIAS                COMMENT    PING ▲  SSH
     ─────────────────────────────────────────────────────────────────────────────────────────
- ▌* ber-core-01   192.0.2.1     ber       Core switch Berlin   5520       ● down  ● no answer
+ ▌* ber-core-01   192.0.2.1     ber       Core switch Berlin   5520       ● down  ● no-answer
     ber-core-02   192.0.2.7     ber       Core switch Berlin   VSP7400    ● up    ● open
 
 ───────────────────────────────────────────────────────────────────────────────────
@@ -138,11 +141,20 @@ From top to bottom:
 | `F1` … `F7` | sort by that column: ▲ ascending → ▼ descending → original order |
 | `Tab` / `Shift-Tab` | next / previous sort column, after the last one: original order |
 | `Ctrl-F` | mark / unmark the selected switch as a [favourite](#favourites-and-recent-switches) |
+| `Ctrl-E` | [export](#export) the current list to a CSV file |
 | `Ctrl-R` | reload the switch list |
 | `Ctrl-L` | redraw the screen |
 | `Ctrl-C` | quit |
 
 In full-screen output (ping, traceroute, details, help): `↑` `↓` `PgUp` `PgDn` scroll, and `ESC` / `Enter` / `q` closes.
+
+**Mouse:**
+- **Click:** a row or tab selects it.
+- **Double-click:** runs the selected command (e.g. ssh on a switch).
+- **Column header:** sorts by that column.
+- **Wheel:** scrolls.
+
+While TRee-Li has the mouse, PuTTY and Tabby select text only with **Shift** held down. If you'd rather keep normal selection, set `mouse = no`.
 
 ## Commands
 
@@ -151,8 +163,8 @@ In full-screen output (ping, traceroute, details, help): `↑` `↓` `PgUp` `PgD
 | **ssh** | Connects to the selected switch. The first time, TRee-Li asks for username and password (see [Security](#security)). Log out to come back; `~.` at the start of a line force-closes a hanging session. |
 | **ping** | `ping -c 4` with live output; also updates the Ping column. |
 | **traceroute** | `traceroute`, or `tracepath` if traceroute isn't installed. |
-| **batch ping** | Checks every switch in the **current, filtered** list in parallel. **PING:** `up` / `down`. **SSH:** `open` (an SSH server answers), `closed` (port refused) or `no answer`. The SSH check only waits for the server's greeting: no login, no password. Sorting by PING or SSH puts problems first. |
-| **details** | All CSV fields of the switch, plus ping state, favourite and last connection. |
+| **batch ping** | Checks every switch in the **current, filtered** list in parallel. **PING:** `up` / `down`. **SSH:** `open` (an SSH server answers), `closed` (port refused) or `no-answer`. The SSH check uses the port ssh itself would use (from `ssh_options` / `~/.ssh/config`) and only waits for the server's greeting: no login, no password. Sorting by PING or SSH puts problems first. Results are [kept](#saved-check-results) until the next check. Without `ping` installed, only SSH is checked. |
+| **details** | All CSV fields of the switch, plus ping/SSH result with time, favourite and last connection. |
 | **help** | Keys, search syntax, and the file paths in use. |
 | **exit** | Quits and forgets the password. |
 
@@ -169,7 +181,7 @@ in this order within one visible column. The best matches come first, and the ma
 | `location:` | the column is empty |
 | `-test`, `-type:edge` | excludes matches (always exact) |
 | `ping:down` | ping state: `up`, `down`, `wait`, or `none` (not checked yet) |
-| `ssh:closed`, `ssh:no` | SSH state: `open`, `closed`, `no` (no answer), `wait`, or `none` |
+| `ssh:closed`, `ssh:no-answer` | SSH state: `open`, `closed`, `no-answer` (`ssh:no` is enough), `wait`, or `none` |
 | `is:fav` | your favourites |
 | `is:recent` | switches you connected to, newest first |
 
@@ -177,9 +189,35 @@ Example: `type:core -ber ping:up ssh:no` shows core switches outside Berlin that
 
 ## Favourites and recent switches
 
-- `Ctrl-F` marks a switch as a favourite (`*`). Favourites are listed first, as long as no column is sorted.
+- `Ctrl-F` marks a switch as a favourite (`*`). Favourites are listed first as long as no column is sorted.
+  During a search, better matches come first and favourites only win ties.
 - Every successful login is remembered. Find those switches with `is:recent`, or see "Last connected" in **details**.
 - Both are stored **per user** in `~/.local/state/tree-li/` (only readable by you), never in the shared folder or the CSV.
+
+## Saved check results
+
+The results of the last ping / batch ping (PING, SSH and their time) are saved per user in
+`~/.local/state/tree-li/status`. After a restart they're shown again until the next check, and **details** shows when
+each one was taken. Several TRee-Li windows merge their results, and the newest one wins.
+
+## Export
+
+`Ctrl-E` writes the **current list** (filter and order as on screen) to `tree-li-export-<date>-<time>.csv`
+in your home directory (`export_dir` in the [configuration](#configuration)). It contains:
+- all CSV columns
+- **Ping** and **SSH** with the time they were checked
+
+Example: search `ssh:no`, press `Ctrl-E`, and you have the list of switches that don't answer SSH.
+The file uses the switch list's delimiter, opens directly in Excel, and is readable only by you.
+
+## Data check
+
+`tree-li --check` checks the switch list and shows the CSV line of every problem:
+- rows with more or fewer fields than the header (often a `;` inside a comment, which shifts the columns)
+- names or IPs that appear more than once
+- missing IPs, unusable hosts, invalid IPv4 addresses (`10.0.0.300`), leading zeros (`010.0.0.5`, which ping reads as octal)
+
+TRee-Li also says so at startup when the list has warnings.
 
 ## Switch list (`data.csv`)
 
@@ -210,7 +248,7 @@ TRee-Li reads these files in order, and later ones win:
 | `--user NAME` | pre-fill the username |
 | `--log` | turn on [session logging](#session-logging) |
 | `--ascii` | plain ASCII instead of lines and symbols ([why](#colours-and-symbols)) |
-| `--check` | check config, switch list and required tools, then exit |
+| `--check` | check config, switch list ([data check](#data-check)) and required tools, then exit |
 | `--version` | show the version |
 
 ## Team setup
@@ -227,17 +265,25 @@ To move TRee-Li without git, e.g. as a mail attachment, pack it into one plain-t
 python3 tools/make-bundle.py          # creates dist/tree-li-bundle-<version>.py
 ```
 
-On the server:
+On the server, copy the bundle into the folder you want to update and run it there:
 
 ```bash
-python3 tree-li-bundle-<version>.py             # unpacks into ./tree-li
-python3 tree-li-bundle-<version>.py /srv/tree-li   # or into another directory
-python3 tree-li-bundle-<version>.py --list      # only show what's inside
+cd ~/tree-li                       # e.g. your git checkout
+python3 tree-li-bundle-<version>.py
+git status                         # if it's a git checkout: review, commit, push
 ```
 
-- **Damage check:** the bundle carries a checksum, so a damaged attachment is detected before anything is written.
-- **Updates:** running a newer bundle over an existing copy updates it.
-- **Your files stay put:** `data.csv` and `tree-li.conf` are never part of a bundle and are never overwritten.
+| Run | Effect |
+|---|---|
+| `python3 tree-li-bundle-<version>.py` | inside an existing TRee-Li folder: **updates it in place**; anywhere else: unpacks into `./tree-li` |
+| `python3 tree-li-bundle-<version>.py DIR` | unpacks / updates exactly in `DIR` |
+| `python3 tree-li-bundle-<version>.py --list` | only shows what's inside |
+
+- **Damage check:** a checksum catches a damaged attachment before anything is written.
+- **Removed files:** files that a newer version no longer has are removed, but only files a bundle installed
+  (they're listed in `.tree-li-files`).
+- **Never touched:** `.git`, `data.csv`, `tree-li.conf` and your own files.
+- **Not committed by accident:** the bundle file and `.tree-li-files` are in `.gitignore`.
 
 ## Session logging
 
@@ -277,6 +323,8 @@ The log contains what was on screen, never the password TRee-Li typed. Commands 
 | Only a few colours in PuTTY | PuTTY *Connection → Data → Terminal-type string* → `xterm-256color` |
 | F-keys don't sort | `Tab` / `Shift-Tab` |
 | Screen garbled | `Ctrl-L` |
+| Can't select text with the mouse | Hold **Shift** while selecting, or set `mouse = no` |
+| SSH column says `closed` but ssh works | The switch uses another port: put it in `ssh_options` (`-p 2222`) or `~/.ssh/config`. The check reads the port from there |
 | Not sure what's wrong | `tree-li --check` |
 
 ## Development

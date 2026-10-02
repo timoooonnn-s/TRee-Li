@@ -6,3 +6,6 @@ __pycache__/
 *.pyc
 .DS_Store
 dist/
+# bundle files dropped into a checkout, and the bundle's file list
+tree-li-bundle-*.py
+.tree-li-files
