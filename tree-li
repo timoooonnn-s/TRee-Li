@@ -70,6 +70,7 @@ DEFAULTS = {
     "ping_workers": "64",
     "ping_timeout": "1",
     "trace_command": "auto",
+    "charset": "auto",
 }
 
 DELIMITERS = {"auto": None, "tab": "\t", "\\t": "\t", "semicolon": ";", "comma": ",", "pipe": "|"}
@@ -200,6 +201,10 @@ def load_config(args):
     cfg.ping_workers = parse_int(raw["ping_workers"], "ping_workers", 1, 256)
     cfg.ping_timeout = parse_int(raw["ping_timeout"], "ping_timeout", 1, 30)
     cfg.trace_command = raw["trace_command"] or "auto"
+    charset = "ascii" if args.ascii else (raw["charset"] or "auto").lower()
+    if charset not in ("auto", "unicode", "ascii"):
+        raise ConfigError("charset: use auto, unicode or ascii")
+    cfg.charset_setting = charset
     return cfg
 
 
@@ -895,12 +900,12 @@ def put(win, y, x, text, attr=0):
             pass
 
 
-def fit(text, width):
+def fit(text, width, more="~"):
     if width <= 0:
         return ""
     if len(text) <= width:
         return text.ljust(width)
-    return text[:width - 1] + "~"
+    return text[:width - 1] + more
 
 
 def fit_widths(widths, available, minimum=6):
@@ -924,32 +929,107 @@ def wrap_lines(lines, width):
     return out
 
 
-class Styles(object):
-    def __init__(self):
-        b, r = curses.A_BOLD, curses.A_REVERSE
-        self.title = self.active = self.selected = r | b
-        self.header = b | curses.A_UNDERLINE
-        self.status = r
-        self.up = self.down = self.error = b
-        self.wait = self.dim = curses.A_DIM
+# Symbols: Unicode when the terminal speaks UTF-8, plain ASCII otherwise (charset = auto).
+# Only characters present in the common PuTTY/Windows fonts (Consolas, Courier New, DejaVu).
+CHARSETS = {
+    "unicode": {"hline": "─", "marker": "▌", "dot": "●", "prompt": "›", "up": "▲",
+                "down": "▼", "sep": "·", "lr": "←→", "ud": "↑↓", "mask": "•",
+                "box": "╭╮╰╯─│", "more": "…", "lt": "‹", "gt": "›",
+                "track": "│", "thumb": "┃"},
+    "ascii": {"hline": "-", "marker": ">", "dot": "*", "prompt": ">", "up": "^", "down": "v", "sep": "|",
+              "lr": "<>", "ud": "Up/Dn", "mask": "*", "box": "++++-|", "more": "~", "lt": "<", "gt": ">",
+              "track": "|", "thumb": "#"},
+}
+
+
+def detect_charset(setting):
+    if setting in CHARSETS:
+        return setting
+    encoding = (locale.getpreferredencoding(False) or "").lower().replace("-", "").replace("_", "")
+    return "unicode" if encoding == "utf8" else "ascii"
+
+
+# name: ((fg, bg, flags) on 256-colour terminals, (fg, bg, flags) on 8-colour terminals)
+# -1 = the terminal's own colour, so light and dark terminal themes both work.
+# Flags: b = bold, d = dim, u = underline, r = reverse.  A broad range of blues as accents.
+PALETTE = {
+    "brand":       ((39, -1, "b"),  ("cyan", -1, "b")),
+    "brand_sub":   ((110, -1, ""),  (-1, -1, "")),
+    "info":        ((67, -1, ""),   ("blue", -1, "b")),
+    "rule":        ((24, -1, ""),   ("blue", -1, "")),
+    "tab":         ((110, -1, ""),  ("cyan", -1, "")),
+    "tab_active":  ((231, 25, "b"), ("white", "blue", "b")),
+    "prompt":      ((39, -1, "b"),  ("cyan", -1, "b")),
+    "cursor":      ((17, 39, ""),   ("black", "cyan", "")),
+    "placeholder": ((60, -1, ""),   (-1, -1, "d")),
+    "head":        ((68, -1, "b"),  ("cyan", -1, "b")),
+    "sort":        ((39, -1, "b"),  ("cyan", -1, "b")),
+    "text":        ((-1, -1, ""),   (-1, -1, "")),
+    "sel":         ((231, 18, "b"), ("white", "blue", "b")),
+    "marker":      ((39, -1, "b"),  ("cyan", -1, "b")),
+    "up":          ((78, -1, "b"),  ("green", -1, "b")),
+    "down":        ((203, -1, "b"), ("red", -1, "b")),
+    "wait":        ((179, -1, ""),  ("yellow", -1, "")),
+    "up_sel":      ((78, 18, "b"),  ("green", "blue", "b")),
+    "down_sel":    ((203, 18, "b"), ("red", "blue", "b")),
+    "wait_sel":    ((179, 18, ""),  ("yellow", "blue", "")),
+    "key":         ((39, -1, "b"),  ("cyan", -1, "b")),
+    "hint":        ((67, -1, ""),   ("blue", -1, "b")),
+    "msg":         ((117, -1, ""),  ("cyan", -1, "")),
+    "err":         ((203, -1, "b"), ("red", -1, "b")),
+    "border":      ((25, -1, ""),   ("blue", -1, "b")),
+    "field":       ((231, 237, ""), (-1, -1, "u")),
+    "banner1":     ((27, -1, "b"),  ("blue", -1, "b")),
+    "banner2":     ((33, -1, "b"),  ("blue", -1, "b")),
+    "banner3":     ((39, -1, "b"),  ("cyan", -1, "")),
+    "banner4":     ((45, -1, "b"),  ("cyan", -1, "b")),
+    "banner5":     ((81, -1, "b"),  ("cyan", -1, "b")),
+}
+# Without colours: attributes only.
+MONO = {"brand": "b", "info": "d", "tab_active": "r", "prompt": "b", "cursor": "r", "placeholder": "d",
+        "head": "b", "sort": "b", "sel": "r", "marker": "b", "up": "b", "down": "b", "up_sel": "r",
+        "down_sel": "r", "wait_sel": "r", "key": "b", "hint": "d", "err": "b", "field": "u",
+        "banner1": "b", "banner2": "b", "banner3": "b", "banner4": "b", "banner5": "b"}
+COLOR_NAMES = {"black": curses.COLOR_BLACK, "red": curses.COLOR_RED, "green": curses.COLOR_GREEN,
+               "yellow": curses.COLOR_YELLOW, "blue": curses.COLOR_BLUE, "cyan": curses.COLOR_CYAN,
+               "white": curses.COLOR_WHITE}
+
+
+class Theme(object):
+    """Every PALETTE name becomes an attribute holding a ready-to-use curses attribute."""
+
+    def __init__(self, charset):
+        self.sym = CHARSETS[charset]
+        self.colors = 0
+        for name in PALETTE:
+            setattr(self, name, self._flags(MONO.get(name, "")))
         try:
             if not curses.has_colors():
                 return
-            bg = -1
             try:
                 curses.use_default_colors()
+                default = -1
             except curses.error:
-                bg = curses.COLOR_BLACK
-            curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
-            curses.init_pair(2, curses.COLOR_GREEN, bg)
-            curses.init_pair(3, curses.COLOR_RED, bg)
-            curses.init_pair(4, curses.COLOR_YELLOW, bg)
-            self.title = self.active = self.selected = curses.color_pair(1) | b
-            self.up = curses.color_pair(2) | b
-            self.down = self.error = curses.color_pair(3) | b
-            self.wait = curses.color_pair(4)
+                default = None
+            rich = curses.COLORS >= 256 and curses.COLOR_PAIRS > len(PALETTE)
+            for number, (name, specs) in enumerate(PALETTE.items(), 1):
+                fg, bg, flags = specs[0] if rich else specs[1]
+                fg, bg = COLOR_NAMES.get(fg, fg), COLOR_NAMES.get(bg, bg)
+                if default is None:
+                    fg = curses.COLOR_WHITE if fg == -1 else fg
+                    bg = curses.COLOR_BLACK if bg == -1 else bg
+                curses.init_pair(number, fg, bg)
+                setattr(self, name, curses.color_pair(number) | self._flags(flags))
+            self.colors = 256 if rich else 8
         except curses.error:
             pass
+
+    @staticmethod
+    def _flags(flags):
+        value = 0
+        for f in flags:
+            value |= {"b": curses.A_BOLD, "d": curses.A_DIM, "u": curses.A_UNDERLINE, "r": curses.A_REVERSE}[f]
+        return value
 
 
 BANNER = [
@@ -969,7 +1049,7 @@ class App(object):
 
     def __init__(self, scr, cfg):
         self.scr, self.cfg = scr, cfg
-        self.st = Styles()
+        self.th = Theme(cfg.charset)
         self.devices, self.view, self.columns, self.widths = [], [], [], []
         self.cursor = self.top = self.cmd = 0
         self.body_h = 1
@@ -979,7 +1059,7 @@ class App(object):
         self.batch = None
         self.creds = None              # (user, password or None) - memory only
         self.last_user = cfg.user
-        self.msg, self.msg_attr, self.msg_until = "", 0, 0
+        self.msg, self.msg_error, self.msg_until = "", False, 0
         self.load_error = None
         self.set_cursor(False)
         self.load()
@@ -994,7 +1074,7 @@ class App(object):
 
     def message(self, text, error=False, seconds=6):
         self.msg = text
-        self.msg_attr = self.st.error if error else 0
+        self.msg_error = error
         self.msg_until = time.time() + seconds
 
     def selected(self):
@@ -1020,7 +1100,7 @@ class App(object):
                 self.message("; ".join(warns), error=True, seconds=15)
         self.widths = [min(40, max([len(label) + 2] + [len(d.cells[i]) for d in self.devices]))
                        for i, (_, label) in enumerate(self.columns)]
-        self.widths.append(len(PING_LABEL) + 2)
+        self.widths.append(len(PING_LABEL) + 2)          # "PING ^" and "* down" both fit
         if keep is not None:
             keep = next((d for d in self.devices if d.host == keep.host and d.name == keep.name), None)
         self.apply_sort(keep)
@@ -1057,64 +1137,116 @@ class App(object):
         self.scr.clear()
 
     # -- drawing ------------------------------------------------------------
+    #
+    #  TRee-Li  Switch Manager                          timmy · 2/29 switches   top bar
+    # ───────────────────────────────────────────────────────────────────────  rule
+    #   ssh   ping   traceroute   batch ping   details   help   exit            tabs
+    #   ›  ber core                                                              search
+    #    NAME          IP           ...                              PING        table head
+    #    ────────────────────────────────────────────────────────────────        rule
+    #  ▌ ber-core-01   192.0.2.1    ...                              ● up        rows
+    # ───────────────────────────────────────────────────────────────────────  rule
+    #  Enter run  ←→ command  type search  F1-F6 sort  ^R reload  ^C quit        footer
+
+    TABLE_X = 3          # column 1 holds the selection marker
 
     def layout(self):
         h, w = self.scr.getmaxyx()
-        gap = 2 if h >= 20 else 1
-        y_cmd = gap
-        y_search = y_cmd + gap
+        gap = 2 if h >= 22 else 1         # blank rows between the blocks when there is room
+        y_tabs = 1 + gap
+        y_search = y_tabs + gap
         y_head = y_search + gap
-        return h, w, y_cmd, y_search, y_head
+        return h, w, y_tabs, y_search, y_head
+
+    def draw_frame(self, subtitle, right="", right_attr=None, hints=(), footer_right="", footer_attr=None,
+                   show_message=True):
+        """Top bar + rule, footer rule + key hints / message.  Shared by all screens."""
+        scr, th, sym = self.scr, self.th, self.th.sym
+        h, w = scr.getmaxyx()
+        put(scr, 0, 2, "TRee-Li", th.brand)
+        put(scr, 0, 11, subtitle[:max(0, w - 14 - len(right))], th.brand_sub)
+        if right:
+            put(scr, 0, max(0, w - len(right) - 2), right, th.info if right_attr is None else right_attr)
+        put(scr, 1, 0, sym["hline"] * w, th.rule)
+        put(scr, h - 2, 0, sym["hline"] * w, th.rule)
+
+        if footer_right:
+            put(scr, h - 1, max(0, w - len(footer_right) - 2), footer_right,
+                th.hint if footer_attr is None else footer_attr)
+        room = w - (len(footer_right) + 4 if footer_right else 2)
+        if show_message and time.time() < self.msg_until:
+            text = sym["dot"] + " " + self.msg
+            if len(text) > room:                  # a message beats the right-hand info
+                room = w - 3
+                put(scr, h - 1, 0, " " * (w - 1))
+            put(scr, h - 1, 2, fit(text, room, sym["more"]).rstrip(), th.err if self.msg_error else th.msg)
+            return
+        x = 2
+        for key, label in hints:
+            if x + len(key) + len(label) + 1 > room:
+                break
+            put(scr, h - 1, x, key, th.key)
+            put(scr, h - 1, x + len(key) + 1, label, th.hint)
+            x += len(key) + len(label) + 3
 
     def draw(self, refresh=True):
-        scr, st = self.scr, self.st
+        scr, th, sym = self.scr, self.th, self.th.sym
         scr.erase()
-        h, w, y_cmd, y_search, y_head = self.layout()
-        if h < 8 or w < 30:
-            put(scr, 0, 0, "Terminal too small", st.error)
-            put(scr, 1, 0, "(min. 30x8)")
+        h, w, y_tabs, y_search, y_head = self.layout()
+        if h < 10 or w < 40:
+            put(scr, 0, 1, "TRee-Li", th.brand)
+            put(scr, 1, 1, "Terminal too small", th.err)
+            put(scr, 2, 1, "min. 40 x 10", th.hint)
             if refresh:
                 scr.refresh()
             return
 
-        put(scr, 0, 0, TITLE.center(w), st.title)
+        right = "%d/%d switches" % (len(self.view), len(self.devices))
+        if self.creds:
+            right = "%s %s %s" % (self.creds[0], sym["sep"], right)
+        batch = ""
+        if self.batch and self.batch.running:
+            batch = "batch ping %d/%d %s ESC cancels" % (self.batch.done, self.batch.total, sym["sep"])
+        hints = [("Enter", "run"), (sym["lr"], "command"), ("type", "search"),
+                 ("F1-F%d" % self.ncols(), "sort"), ("^R", "reload"), ("^C", "quit")]
+        self.draw_frame("Switch Manager", right, hints=hints, footer_right=batch, footer_attr=th.wait)
 
-        # command bar
-        cell = max(len(c) for c in COMMANDS) + 2
-        gap = 2
-        if 2 + len(COMMANDS) * (cell + gap) > w:
-            cell, gap = 0, 1
-        if 2 + sum(len(c) + 2 + gap for c in COMMANDS) > w:
-            # too narrow for the whole bar: show only the selected command
-            put(scr, y_cmd, 2, "Command: <")
-            put(scr, y_cmd, 12, " " + COMMANDS[self.cmd] + " ", st.active)
-            put(scr, y_cmd, 14 + len(COMMANDS[self.cmd]), ">")
-        else:
+        # command tabs
+        if 2 + sum(len(c) + 3 for c in COMMANDS) <= w:
             x = 2
             for i, name in enumerate(COMMANDS):
-                text = "[" + name.center(max(cell, len(name) + 2) - 2) + "]"
-                put(scr, y_cmd, x, text, st.active if i == self.cmd else 0)
-                x += len(text) + gap
+                put(scr, y_tabs, x, " %s " % name, th.tab_active if i == self.cmd else th.tab)
+                x += len(name) + 3
+        else:                                       # narrow terminal: only the selected command
+            put(scr, y_tabs, 2, sym["lt"], th.tab)
+            put(scr, y_tabs, 4, " %s " % COMMANDS[self.cmd], th.tab_active)
+            put(scr, y_tabs, 7 + len(COMMANDS[self.cmd]), sym["gt"], th.tab)
 
-        # search line
-        put(scr, y_search, 1, "Search: ", curses.A_BOLD)
-        if self.query:
-            put(scr, y_search, 9, self.query[-(w - 12):] + "_")
-        else:
-            put(scr, y_search, 9, "type to filter - all words must match", st.dim)
+        # search
+        put(scr, y_search, 2, sym["prompt"], th.prompt)
+        shown = self.query[-(w - 9):]
+        put(scr, y_search, 5, shown, th.text)
+        put(scr, y_search, 5 + len(shown), " ", th.cursor)
+        if not self.query:
+            put(scr, y_search, 7, "type to search %s all words must match" % sym["sep"], th.placeholder)
 
-        # table
-        widths = fit_widths(self.widths, w - 2 - 2 * (len(self.widths) - 1))
+        # table head
+        x0 = self.TABLE_X
+        widths = fit_widths(self.widths, w - x0 - 3 - 2 * (len(self.widths) - 1))
+        table_w = sum(widths) + 2 * (len(widths) - 1)
         labels = [label for _, label in self.columns] + [PING_LABEL]
-        x = 1
+        x = x0
         for i, label in enumerate(labels):
-            if i == self.sort_col:
-                label += " v" if self.sort_desc else " ^"
-            put(scr, y_head, x, fit(label, widths[i]), st.header)
+            label = label.upper()
+            put(scr, y_head, x, fit(label, widths[i], sym["more"]), th.head)
+            if i == self.sort_col and len(label) + 2 <= widths[i]:
+                put(scr, y_head, x + len(label) + 1, sym["down"] if self.sort_desc else sym["up"], th.sort)
             x += widths[i] + 2
+        put(scr, y_head + 1, x0, sym["hline"] * table_w, th.rule)
 
-        y_body = y_head + 1
-        self.body_h = body_h = max(1, h - 1 - y_body)
+        # rows
+        y_body = y_head + 2
+        self.body_h = body_h = max(1, h - 2 - y_body)
         if self.cursor >= len(self.view):
             self.cursor = max(0, len(self.view) - 1)
         if self.cursor < self.top:
@@ -1125,13 +1257,14 @@ class App(object):
 
         if not self.view:
             if self.load_error:
-                text = self.load_error
+                text, attr = self.load_error, th.err
             elif self.devices:
-                text = "No switch matches '%s'  (ESC clears the search)" % self.query
+                text, attr = "No switch matches '%s'  %s  ESC clears the search" % (self.query, sym["sep"]), th.placeholder
             else:
-                text = "The switch list is empty"
-            put(scr, y_body + 1, 2, text, st.error if self.load_error else st.dim)
+                text, attr = "The switch list is empty", th.placeholder
+            put(scr, y_body + 1, x0, text, attr)
 
+        names = {PING_UP: "up", PING_DOWN: "down", PING_WAIT: "wait"}
         for row in range(body_h):
             idx = self.top + row
             if idx >= len(self.view):
@@ -1140,30 +1273,26 @@ class App(object):
             y = y_body + row
             sel = idx == self.cursor
             if sel:
-                put(scr, y, 0, " " * w, st.selected)
-            x = 1
+                put(scr, y, 1, sym["marker"], th.marker)
+                put(scr, y, 2, " " * (w - 4), th.sel)
+            x = x0
             for i, value in enumerate(d.cells):
-                put(scr, y, x, fit(value, widths[i]), st.selected if sel else 0)
+                put(scr, y, x, fit(value, widths[i], sym["more"]), th.sel if sel else th.text)
                 x += widths[i] + 2
             state = self.ping.get(d.host, "")
             if state:
-                attr = {PING_UP: st.up, PING_DOWN: st.down}.get(state, st.wait)
-                put(scr, y, x, fit(state, widths[-1]), st.selected if sel else attr)
+                style = {PING_UP: "up", PING_DOWN: "down"}.get(state, "wait") + ("_sel" if sel else "")
+                put(scr, y, x, fit("%s %s" % (sym["dot"], names.get(state, state)), widths[-1]),
+                    getattr(th, style))
 
-        # status line
-        right = "%d/%d switches " % (len(self.view), len(self.devices))
-        if self.creds:
-            right = "user: %s | %s" % (self.creds[0], right)
-        if self.batch and self.batch.running:
-            right = "batch ping %d/%d (ESC cancels) | %s" % (self.batch.done, self.batch.total, right)
-        if time.time() < self.msg_until:
-            left, attr = " " + self.msg, self.msg_attr | curses.A_REVERSE
-        else:
-            left = " Enter: run  Left/Right: command  type: search  F1-F%d/Tab: sort" % self.ncols()
-            attr = st.status
-        put(scr, h - 1, 0, " " * w, st.status)
-        put(scr, h - 1, 0, left[:max(0, w - len(right) - 2)], attr)
-        put(scr, h - 1, max(0, w - len(right) - 1), right, st.status)
+        # scrollbar when the list is longer than the screen
+        if len(self.view) > body_h:
+            thumb = max(1, body_h * body_h // len(self.view))
+            pos = self.top * (body_h - thumb) // max(1, len(self.view) - body_h)
+            for row in range(body_h):
+                inside = pos <= row < pos + thumb
+                put(scr, y_body + row, w - 1, sym["thumb"] if inside else sym["track"],
+                    th.marker if inside else th.rule)
         if refresh:
             scr.refresh()
 
@@ -1300,31 +1429,49 @@ class App(object):
     # -- popups -------------------------------------------------------------
 
     def show_text(self, title, lines=None, stream=None):
-        """Full screen text viewer.  ESC / Enter / q closes; streams are stopped on close."""
-        scr, st = self.scr, self.st
+        """Full screen viewer.  Lines are strings (wrapped) or lists of (text, attr)
+        segments (drawn as they are).  ESC / Enter / q closes; streams are stopped."""
+        scr, th, sym = self.scr, self.th, self.th.sym
         offset, follow = 0, stream is not None
         try:
             while True:
                 h, w = scr.getmaxyx()
                 content = stream.snapshot() if stream else lines
-                wrapped = wrap_lines(content, w - 2)
-                body_h = max(1, h - 3)
-                max_off = max(0, len(wrapped) - body_h)
+                rows = []
+                for line in content:
+                    if isinstance(line, list):
+                        rows.append(line)
+                    else:
+                        attr = th.info if line.startswith("$ ") else th.hint if line.startswith("[finished") else th.text
+                        rows += [[(part, attr)] for part in wrap_lines([line], w - 5)]
+                body_h = max(1, h - 5)          # top bar, rule, blank ... rule, footer
+                max_off = max(0, len(rows) - body_h)
                 if follow:
                     offset = max_off
                 offset = max(0, min(offset, max_off))
+
                 scr.erase()
-                put(scr, 0, 0, (" " + title + " ").center(w), st.title)
-                hint = " ESC / Enter: close    Up/Down/PgUp/PgDn: scroll"
-                if stream and not stream.done:
-                    hint += "    [running - ESC stops]"
-                put(scr, 1, 0, hint, st.dim)
-                for i, line in enumerate(wrapped[offset:offset + body_h]):
-                    put(scr, 2 + i, 1, line)
-                if len(wrapped) > body_h:
-                    pos = " lines %d-%d of %d " % (offset + 1, min(len(wrapped), offset + body_h), len(wrapped))
-                    put(scr, h - 1, max(0, w - len(pos) - 1), pos, st.status)
+                right, right_attr = "", None
+                if stream:
+                    if not stream.done:
+                        right, right_attr = sym["dot"] + " running", th.wait
+                    elif stream.returncode == 0:
+                        right, right_attr = sym["dot"] + " done", th.up
+                    else:
+                        right, right_attr = "%s exit %s" % (sym["dot"], stream.returncode), th.down
+                position = ""
+                if len(rows) > body_h:
+                    position = "%d-%d / %d" % (offset + 1, min(len(rows), offset + body_h), len(rows))
+                hints = [("ESC", "close"), (sym["ud"], "scroll"), ("PgUp PgDn", "page")]
+                self.draw_frame("%s %s" % (sym["gt"], title), right, right_attr, hints, position,
+                                show_message=False)
+                for i, segments in enumerate(rows[offset:offset + body_h]):
+                    x = 3
+                    for text, attr in segments:
+                        put(scr, 3 + i, x, text, attr)
+                        x += len(text)
                 scr.refresh()
+
                 key = read_key(scr, 150)
                 if key in ("ESC", "ENTER", "q", "Q"):
                     break
@@ -1349,47 +1496,50 @@ class App(object):
                 stream.stop()
 
     def show_details(self, dev):
-        keys = list(dev.values.keys()) + [PING_LABEL]
-        width = max(len(k) for k in keys)
-        lines = ["%s : %s" % (k.ljust(width), v) for k, v in dev.values.items()]
-        lines.append("%s : %s" % (PING_LABEL.ljust(width), self.ping.get(dev.host, "not checked")))
-        self.show_text("details %s" % dev.name, lines=lines)
+        th = self.th
+        values = list(dev.values.items()) + [(PING_LABEL, self.ping.get(dev.host, "not checked"))]
+        width = max(len(k) for k, _ in values)
+        lines = [[(k.ljust(width), th.head), ("   ", th.text), (v, th.text)] for k, v in values]
+        self.show_text("details %s %s" % (self.th.sym["sep"], dev.name), lines=lines)
 
     def show_help(self):
-        log = ("on, " + self.cfg.log_dir) if self.cfg.session_log else "off (start with --log to record)"
-        lines = BANNER + [
-            "",
-            "  %s  v%s" % (TITLE, VERSION),
-            "",
-            "  Main screen",
-            "    Up/Down PgUp/PgDn Home/End   select a switch",
-            "    Left/Right                   select a command",
-            "    Enter                        run the selected command",
-            "    just type                    search - several words must all match",
-            "    Backspace / Ctrl-U / ESC     edit / clear the search",
-            "    F1..F%-2d or Tab / Shift-Tab   sort by column (same key again = reverse)" % self.ncols(),
-            "    Ctrl-R                       reload the switch list",
-            "    Ctrl-C                       quit",
-            "",
-            "  Commands",
-            "    ssh          connect - user/password are asked once and kept in memory",
-            "                 only until TRee-Li exits. Log out of the switch to come back.",
-            "    ping         ping the selected switch",
-            "    traceroute   trace the path (traceroute, or tracepath if not installed)",
-            "    batch ping   ping every switch in the current (filtered) list -> Ping column",
-            "    details      show all fields of the selected switch",
-            "    help         this screen",
-            "    exit         quit TRee-Li and forget the credentials",
-            "",
-            "  Inside an ssh session",
-            "    ~.           (at the start of a line) force-disconnect a hanging session",
-            "",
-            "  Switch list    %s  (%d switches)" % (self.cfg.data, len(self.devices)),
-            "  Config files   %s" % (", ".join(self.cfg.files) or "none (defaults)"),
-            "  Session log    %s" % log,
-            "",
-            "  Inspired by V-Li: Switch Manager (Franz, 2025).",
-        ]
+        th = self.th
+        log = self.cfg.log_dir if self.cfg.session_log else "off  (start with --log to record sessions)"
+        lines = [[(b, getattr(th, "banner%d" % (i + 1)))] for i, b in enumerate(BANNER)]
+        lines += [[], [(TITLE, th.brand), ("   v" + VERSION, th.hint)], []]
+
+        def section(name):
+            lines.append([])
+            lines.append([(name.upper(), th.head)])
+
+        def item(key, text):
+            lines.append([("  " + key.ljust(30), th.key), (text, th.text)])
+
+        section("Main screen")
+        item("Up Down PgUp PgDn Home End", "select a switch")
+        item("Left Right", "select a command")
+        item("Enter", "run the selected command")
+        item("just type", "search - several words must all match")
+        item("Backspace  Ctrl-U  ESC", "edit / clear the search")
+        item("F1..F%d  Tab  Shift-Tab" % self.ncols(), "sort by column (same key again = reverse)")
+        item("Ctrl-R", "reload the switch list")
+        item("Ctrl-C", "quit")
+        section("Commands")
+        item("ssh", "connect - user/password are asked once and kept")
+        item("", "in memory only. Log out of the switch to come back.")
+        item("ping", "ping the selected switch")
+        item("traceroute", "trace the path (traceroute, or tracepath)")
+        item("batch ping", "ping every switch in the current list -> Ping column")
+        item("details", "all fields of the selected switch")
+        item("help", "this screen")
+        item("exit", "quit TRee-Li and forget the credentials")
+        section("Inside an ssh session")
+        item("~.", "(at the start of a line) force-disconnect a hanging session")
+        section("Setup")
+        item("Switch list", "%s  (%d switches)" % (self.cfg.data, len(self.devices)))
+        item("Config files", ", ".join(self.cfg.files) or "none (defaults)")
+        item("Session log", log)
+        lines += [[], [("Inspired by V-Li: Switch Manager (Franz, 2025).", th.hint)]]
         self.show_text("help", lines=lines)
 
     # -- credentials --------------------------------------------------------
@@ -1398,80 +1548,75 @@ class App(object):
         """Ask user + password.  Returns (user, password or None) or None on ESC."""
         user, pw = self.last_user or "", ""
         field = 1 if user else 0
-        scr, st = self.scr, self.st
-        try:
-            while True:
-                self.draw(refresh=False)
-                h, w = scr.getmaxyx()
-                bw, bh = min(66, w - 2), 12
-                y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
-                fw = max(4, bw - 15)
-                lines = [
-                    ("Login - asked once per TRee-Li session", curses.A_BOLD),
-                    ("", 0),
-                    None, None,
-                    ("", 0),
-                    (error or "", st.error),
-                    ("Kept in memory only, forgotten when TRee-Li exits.", 0),
-                    ("Empty password: ssh asks at every login instead.", st.dim),
-                    ("Enter: OK   Tab: next field   ESC: cancel", st.dim),
-                ]
-                put(scr, y0, x0, "+" + "-" * (bw - 2) + "+")
-                for i in range(1, bh - 1):
-                    put(scr, y0 + i, x0, "|" + " " * (bw - 2) + "|")
-                put(scr, y0 + bh - 1, x0, "+" + "-" * (bw - 2) + "+")
-                for i, item in enumerate(lines):
-                    if item:
-                        put(scr, y0 + 1 + i, x0 + 2, item[0][:bw - 4], item[1])
-                values = [user, "*" * len(pw)]
-                for i, label in enumerate(("Username:", "Password:")):
-                    y = y0 + 3 + i
-                    put(scr, y, x0 + 2, label, curses.A_BOLD if field == i else 0)
-                    put(scr, y, x0 + 13, fit(values[i][-(fw - 1):], fw), curses.A_UNDERLINE)
-                cy = y0 + 3 + field
-                cx = x0 + 13 + min(len(values[field]), fw - 1)
-                self.set_cursor(True)
-                try:
-                    scr.move(cy, cx)
-                except curses.error:
-                    pass
-                scr.refresh()
+        scr, th, sym = self.scr, self.th, self.th.sym
+        tl, tr, bl, br, hl, vl = sym["box"]
+        while True:
+            self.draw(refresh=False)
+            h, w = scr.getmaxyx()
+            bw, bh = min(62, w - 4), 13
+            y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+            fw = max(6, bw - 18)
 
-                key = read_key(scr, -1)
-                if key is None:
+            title = " Login "
+            put(scr, y0, x0, tl + hl + title + hl * (bw - 3 - len(title)) + tr, th.border)
+            put(scr, y0, x0 + 2, title, th.brand)
+            for i in range(1, bh - 1):
+                put(scr, y0 + i, x0, vl + " " * (bw - 2) + vl, th.border)
+                put(scr, y0 + i, x0 + 1, " " * (bw - 2), th.text)
+            put(scr, y0 + bh - 1, x0, bl + hl * (bw - 2) + br, th.border)
+
+            values = [user, sym["mask"] * len(pw)]
+            for i, label in enumerate(("Username", "Password")):
+                y = y0 + 2 + i * 2
+                put(scr, y, x0 + 3, label, th.prompt if field == i else th.hint)
+                shown = values[i][-(fw - 2):]
+                put(scr, y, x0 + 14, " " + shown.ljust(fw - 1), th.field)
+                if field == i:
+                    put(scr, y, x0 + 15 + len(shown), " ", th.cursor)
+            if error:
+                put(scr, y0 + 6, x0 + 3, (sym["dot"] + " " + error)[:bw - 6], th.err)
+            put(scr, y0 + 8, x0 + 3, ("Kept in memory only %s forgotten when TRee-Li exits" % sym["sep"])[:bw - 6], th.hint)
+            put(scr, y0 + 9, x0 + 3, "Empty password: ssh asks at every login"[:bw - 6], th.hint)
+            x = x0 + 3
+            for key, label in (("Enter", "OK"), ("Tab", "next field"), ("ESC", "cancel")):
+                put(scr, y0 + 11, x, key, th.key)
+                put(scr, y0 + 11, x + len(key) + 1, label, th.hint)
+                x += len(key) + len(label) + 4
+            scr.refresh()
+
+            key = read_key(scr, -1)
+            if key is None:
+                continue
+            if key == "ESC":
+                return None
+            if key in ("TAB", "BTAB", "UP", "DOWN"):
+                field = 1 - field
+            elif key == "ENTER":
+                if field == 0:
+                    field = 1
                     continue
-                if key == "ESC":
-                    return None
-                if key in ("TAB", "BTAB", "UP", "DOWN"):
-                    field = 1 - field
-                elif key == "ENTER":
-                    if field == 0:
-                        field = 1
-                        continue
-                    if not valid_user(user):
-                        error, field = "Please enter a valid username.", 0
-                        continue
-                    self.last_user = user
-                    return user, (pw or None)
-                elif key == "BACKSPACE":
-                    if field == 0:
-                        user = user[:-1]
-                    else:
-                        pw = pw[:-1]
-                elif key == "CTRL_U":
-                    if field == 0:
-                        user = ""
-                    else:
-                        pw = ""
-                elif key == "RESIZE":
-                    self.sync_size()
-                elif len(key) == 1:
-                    if field == 0:
-                        user += key
-                    else:
-                        pw += key
-        finally:
-            self.set_cursor(False)
+                if not valid_user(user):
+                    error, field = "Please enter a valid username.", 0
+                    continue
+                self.last_user = user
+                return user, (pw or None)
+            elif key == "BACKSPACE":
+                if field == 0:
+                    user = user[:-1]
+                else:
+                    pw = pw[:-1]
+            elif key == "CTRL_U":
+                if field == 0:
+                    user = ""
+                else:
+                    pw = ""
+            elif key == "RESIZE":
+                self.sync_size()
+            elif len(key) == 1:
+                if field == 0:
+                    user += key
+                else:
+                    pw += key
 
     # -- ssh ----------------------------------------------------------------
 
@@ -1501,6 +1646,14 @@ class App(object):
                 self.message(text, error=True, seconds=10)
             return
 
+    def note(self, *lines):
+        """Text printed outside curses, around an ssh session: 'TRee-Li > first line', rest indented."""
+        prefix = "TRee-Li"
+        if self.th.colors:
+            prefix = "\033[1;34m%s\033[0m" % prefix          # bold blue: every colour terminal knows it
+        indent = "\r\n" + " " * 10
+        return "\r\n%s %s %s" % (prefix, self.th.sym["gt"], indent.join(lines))
+
     def open_log(self, dev, user):
         try:
             os.makedirs(self.cfg.log_dir, mode=0o700, exist_ok=True)
@@ -1511,7 +1664,7 @@ class App(object):
                      % (dev.name, dev.host, user, time.strftime("%Y-%m-%d %H:%M:%S"))).encode("utf-8"))
             return f
         except OSError as e:
-            os.write(sys.stdout.fileno(), ("[TRee-Li] cannot write session log: %s\r\n" % e).encode())
+            os.write(sys.stdout.fileno(), self.note("cannot write session log: %s\r\n" % e).encode("utf-8", "replace"))
             return None
 
     def run_ssh(self, dev, user, password):
@@ -1521,9 +1674,9 @@ class App(object):
         try:
             while True:
                 argv = build_ssh_argv(self.cfg, user, dev.host, inject_password=bool(password))
-                os.write(out, ("\r\n[TRee-Li] Connecting to %s (%s) as %s ...  "
-                               "(log out to return, ~. to force-disconnect)\r\n"
-                               % (dev.name, dev.host, user)).encode("utf-8", "replace"))
+                os.write(out, (self.note("Connecting to %s (%s) as %s" % (dev.name, dev.host, user),
+                                         "log out to return to TRee-Li, ~. force-disconnects") + "\r\n\r\n")
+                         .encode("utf-8", "replace"))
                 log = self.open_log(dev, user) if self.cfg.session_log else None
                 try:
                     result = run_session(argv, password, log)
@@ -1533,28 +1686,27 @@ class App(object):
                 if result.hostkey_changed and not result.auth_failed:
                     known_hosts = result.known_hosts or os.path.join(os.path.expanduser("~"), ".ssh", "known_hosts")
                     if key_removed:
-                        terminal_wait_key("\r\n[TRee-Li] The host key is still reported as changed - "
-                                          "please check %s by hand.\r\n          Press any key to return to "
-                                          "TRee-Li ..." % known_hosts)
+                        terminal_wait_key(self.note("The host key is still reported as changed.",
+                                                    "Please check %s by hand." % known_hosts,
+                                                    "Press any key to return to TRee-Li ..."))
                         return result
-                    answer = terminal_wait_key(
-                        "\r\n[TRee-Li] The host key of %s (%s) has CHANGED.\r\n"
-                        "          Expected if the switch was replaced - otherwise do NOT continue.\r\n"
-                        "          Remove the old key from %s and connect again? [y/N] "
-                        % (dev.name, dev.host, known_hosts))
+                    answer = terminal_wait_key(self.note(
+                        "The host key of %s (%s) has CHANGED." % (dev.name, dev.host),
+                        "Expected if the switch was replaced - otherwise do NOT continue.",
+                        "Remove the old key from %s and connect again? [y/N] " % known_hosts))
                     if answer not in (b"y", b"Y"):
                         return result
                     ok, text = remove_host_key(dev.host, known_hosts)
                     os.write(out, (text.replace("\n", "\r\n") + "\r\n").encode("utf-8", "replace"))
                     if not ok:
-                        terminal_wait_key("[TRee-Li] Could not remove the old key. "
-                                          "Press any key to return to TRee-Li ...")
+                        terminal_wait_key(self.note("Could not remove the old key.",
+                                                    "Press any key to return to TRee-Li ..."))
                         return result
                     key_removed = True
                     continue
                 if result.failed and not result.auth_failed:
-                    terminal_wait_key("\r\n[TRee-Li] Connection to %s ended (exit code %d). "
-                                      "Press any key to return to TRee-Li ..." % (dev.name, result.exit_code))
+                    terminal_wait_key(self.note("Connection to %s ended (exit code %d)." % (dev.name, result.exit_code),
+                                                "Press any key to return to TRee-Li ..."))
                 return result
         finally:
             self.resume_curses()
@@ -1607,6 +1759,7 @@ def main(argv=None):
     parser.add_argument("--config", metavar="FILE", help="additional config file")
     parser.add_argument("--user", help="pre-fill the ssh username (default: your Linux user)")
     parser.add_argument("--log", action="store_true", help="record ssh sessions to log files")
+    parser.add_argument("--ascii", action="store_true", help="plain ASCII screen (if lines/symbols look garbled)")
     parser.add_argument("--check", action="store_true", help="check config and switch list, then exit")
     parser.add_argument("--version", action="version", version="%(prog)s " + VERSION)
     args = parser.parse_args(argv)
@@ -1627,6 +1780,7 @@ def main(argv=None):
         locale.setlocale(locale.LC_ALL, "")
     except locale.Error:
         pass
+    cfg.charset = detect_charset(cfg.charset_setting)
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(143))
     try:
         curses.wrapper(lambda scr: App(scr, cfg).run())

@@ -62,10 +62,11 @@ class UiSmokeTest(unittest.TestCase):
         self.assertNotIn("fake-good", self.screen())
         # ESC and a key in the same burst: search is cleared AND the key is kept
         self.keys("\x1bf", literal=True)
-        self.wait_for("Search: f")
+        self.wait_for("fake-good")
+        self.assertNotIn("sw10", self.screen())             # the search is "f" now
         self.keys("C-u")
         self.keys("Enter")                       # ssh is the default command
-        self.wait_for("Username:")
+        self.wait_for("Username")
         self.keys("secret", literal=True)
         self.keys("Enter")
         self.wait_for("FAKE-SW:1>")
@@ -78,7 +79,7 @@ class UiSmokeTest(unittest.TestCase):
     def test_failed_connection_pauses(self):
         self.keys("dead", literal=True)
         self.keys("Enter")
-        self.wait_for("Username:")
+        self.wait_for("Username")
         self.keys("secret", literal=True)
         self.keys("Enter")
         self.wait_for("Press any key")

@@ -11,11 +11,16 @@
 8. [x] Tests: 36 (logic, ssh relay against `tests/fake_ssh.py` through a pty, tmux UI smoke test); Python 3.8/3.9/3.11/3.14
 9. [x] README, `data.example.csv`, `tree-li.conf.example`, `.gitignore`, `.gitattributes`
 
+## Milestone 1b: review fixes + redesign. DONE (2026-10-02)
+- [x] All 10 review findings fixed (see code-review), 38 tests
+- [x] Redesign per D11; verified in 256 colours, 8 colours and ASCII
+- [x] Restored `.gitignore` / `.gitattributes` (missing from the first push!)
+
 ## Milestone 2: field test (needs the user)
 - [ ] Run `./tree-li --check` on the RHEL server
 - [ ] ssh into a real Extreme Fabric Engine switch: password prompt detected? logout returns to the menu?
 - [ ] Try a wrong password once: one attempt only, then asked again
-- [ ] Try it from PuTTY (F-keys, colours) and from Tabby
+- [ ] Try it from PuTTY (F-keys, colours, Unicode lines) and from Tabby
 - [ ] Batch ping over all ~700 switches: duration acceptable?
 
 ## Backlog (only if asked)

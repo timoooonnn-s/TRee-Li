@@ -23,18 +23,26 @@ opening a new desktop window.
 ## Screen
 
 ```
-                       TRee-Li: Switch Manager
+  TRee-Li  Switch Manager                                     timmy · 2/29 switches
+───────────────────────────────────────────────────────────────────────────────────
 
-  [   ssh    ]  [   ping   ]  [traceroute]  [batch ping]  [ details  ]  [   help   ]  [   exit   ]
+   ssh   ping   traceroute   batch ping   details   help   exit
 
- Search: ber core_
+  ›  ber core
 
- Name          IP            subnet    Alias                comment    Ping ^
- ber-core-01   192.0.2.1     ber       Core switch Berlin   5520       DOWN
- ber-core-02   192.0.2.7     ber       Core switch Berlin   VSP7400    UP
+   NAME          IP            SUBNET    ALIAS                COMMENT    PING ▲
+   ─────────────────────────────────────────────────────────────────────────────
+ ▌ ber-core-01   192.0.2.1     ber       Core switch Berlin   5520       ● down
+   ber-core-02   192.0.2.7     ber       Core switch Berlin   VSP7400    ● up
 
- Batch ping finished: 1 UP, 1 DOWN                          user: timmy | 2/29 switches
+───────────────────────────────────────────────────────────────────────────────────
+  Enter run  ←→ command  type search  F1-F6 sort  ^R reload  ^C quit
 ```
+
+Colours are shades of blue. They adapt to the terminal: 256 colours in Tabby or with
+`TERM=xterm-256color`, 8 colours in PuTTY's default `TERM=xterm`, and plain bold/reverse without colour.
+Lines and symbols use Unicode on UTF-8 terminals. If they look garbled (an old PuTTY
+font or a non-UTF-8 character set), start with `--ascii` or set `charset = ascii`.
 
 ## Keys
 
@@ -115,7 +123,7 @@ Everything is optional. See [`tree-li.conf.example`](tree-li.conf.example) for a
 2. `~/.config/tree-li/tree-li.conf`: your personal settings
 3. `--config FILE`
 
-Command line options: `--data CSV`, `--user NAME`, `--log`, `--config FILE`, `--check`, `--version`.
+Command line options: `--data CSV`, `--user NAME`, `--log`, `--ascii`, `--config FILE`, `--check`, `--version`.
 The environment variable `TREELI_DATA` also sets the switch list.
 
 ### Session logging (off by default)
@@ -149,6 +157,8 @@ Be aware that commands like `show running-config` can include secrets.
 | `switch list not found` | `cp data.example.csv data.csv`, or set `data =` in `tree-li.conf` |
 | Old switch: `no matching key exchange method` / `host key type` | Add e.g. `ssh_options = -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa` in `tree-li.conf`. On RHEL 9 the system crypto policy may also need to allow SHA-1 |
 | F-keys don't sort | Use `Tab` / `Shift-Tab` |
+| Lines or symbols look garbled (`â”€`, `?`) | Start with `tree-li --ascii`, or set `charset = ascii` in `tree-li.conf`. In PuTTY you can also set *Window > Translation* to UTF-8 |
+| Only a few colours in PuTTY | Set *Connection > Data > Terminal-type string* to `xterm-256color` |
 | Garbled screen | Press `Ctrl-L`, or check that `TERM` is set (`xterm-256color` for Tabby, `xterm` for PuTTY) |
 | Check everything at once | `tree-li --check` |
 

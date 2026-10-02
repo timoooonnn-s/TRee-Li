@@ -54,3 +54,11 @@ The command is `tree-li` (`tree` already exists on Linux, so the hyphenated name
 ## D10: Repository hygiene (Warden)
 - `data.csv` and `tree-li.conf` are git-ignored. The real inventory never goes to GitHub; `data.example.csv` and `tree-li.conf.example` are shipped instead.
 - `.gitattributes` forces LF line endings, because the repo travels through Windows and a CRLF shebang breaks.
+
+## D11: Visual redesign (user choices, 2026-10-02)
+- **Layout:** slim top bar (brand left, user and count right), thin rules, command **tabs** (the active tab has a blue background), a `›` search prompt, an uppercase table header with its own rule, and a footer with key hints. Messages replace the hints for a few seconds.
+- **Colours:** a broad range of blues (256-colour palette: 17-117). The terminal's own foreground is used for body text, so light terminal themes still work. 8-colour fallback for PuTTY's default `TERM=xterm`; attributes only without colour.
+- **Popups:** full screen, same top bar and footer frame. ping/traceroute show a running / done / exit status.
+- **Switch list:** `● up` / `● down` coloured dots, a `▌` selection marker, a scrollbar for long lists.
+- *Critic:* Unicode only for characters in common Windows fonts, and an automatic ASCII fallback (`charset`, `--ascii`). Python's C-locale coercion reports UTF-8 even under `LANG=C`, so the manual switch is the real escape hatch.
+- *Operator:* the login dialog draws its own block cursor instead of relying on the terminal cursor (PuTTY often hides that).

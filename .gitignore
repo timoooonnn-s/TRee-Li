@@ -1,0 +1,7 @@
+# Site specific - keep switch lists and local settings out of git
+data.csv
+tree-li.conf
+*.log
+__pycache__/
+*.pyc
+.DS_Store

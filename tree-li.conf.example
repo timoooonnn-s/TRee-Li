@@ -49,3 +49,7 @@
 
 # "auto" uses traceroute if installed, otherwise tracepath.
 #trace_command = auto
+
+# Screen symbols: auto (Unicode on UTF-8 terminals), unicode, or ascii
+# (use ascii if lines/dots look garbled, e.g. old PuTTY fonts). Also: tree-li --ascii
+#charset = auto

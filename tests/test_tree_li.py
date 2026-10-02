@@ -19,7 +19,7 @@ _loader.exec_module(tl)
 
 
 def args(**kw):
-    base = dict(config=None, data=None, user=None, log=False, check=False)
+    base = dict(config=None, data=None, user=None, log=False, check=False, ascii=False)
     base.update(kw)
     return types.SimpleNamespace(**base)
 
@@ -178,6 +178,22 @@ class TestSecurityHelpers(unittest.TestCase):
         self.assertNotIn("NumberOfPasswordPrompts=1", tl.build_ssh_argv(cfg, "t", "h", inject_password=False))
 
 
+class TestCharset(TempDir):
+    def test_setting_and_flag(self):
+        self.assertEqual(tl.detect_charset("ascii"), "ascii")
+        self.assertEqual(tl.detect_charset("unicode"), "unicode")
+        self.assertIn(tl.detect_charset("auto"), ("ascii", "unicode"))
+        self.assertEqual(tl.load_config(args(ascii=True)).charset_setting, "ascii")
+        with self.assertRaises(tl.ConfigError):
+            tl.load_config(args(config=self.write("c.conf", "[tree-li]\ncharset = emoji\n")))
+
+    def test_symbol_sets_match(self):
+        self.assertEqual(set(tl.CHARSETS["ascii"]), set(tl.CHARSETS["unicode"]))
+        for value in tl.CHARSETS["ascii"].values():
+            value.encode("ascii")
+        self.assertEqual(len(tl.CHARSETS["unicode"]["box"]), 6)
+
+
 class TestKeys(unittest.TestCase):
     def test_escape_sequences(self):
         cases = {"": "ESC", "[A": "UP", "OA": "UP", "[11~": "F1", "OP": "F1", "[[E": "F5",
@@ -190,6 +206,7 @@ class TestDrawingHelpers(unittest.TestCase):
     def test_fit(self):
         self.assertEqual(tl.fit("abc", 5), "abc  ")
         self.assertEqual(tl.fit("abcdef", 4), "abc~")
+        self.assertEqual(tl.fit("abcdef", 4, "\u2026"), "abc\u2026")
 
     def test_fit_widths(self):
         self.assertEqual(sum(tl.fit_widths([40, 20, 6], 50)), 50)
