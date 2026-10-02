@@ -143,10 +143,110 @@ class TestSearchSort(unittest.TestCase):
         self.assertEqual([d.host for d in tl.sort_devices(ds, 1, False, {})],
                          ["10.0.0.2", "10.0.0.9", "10.0.0.10"])
 
+    def test_sort_key_cycle_and_off(self):
+        state = (None, False)
+        seen = []
+        for _ in range(4):
+            state = tl.next_sort(state[0], state[1], 2)
+            seen.append(state)
+        self.assertEqual(seen, [(2, False), (2, True), (None, False), (2, False)])
+        self.assertEqual(tl.next_sort(2, True, 0), (0, False))           # other column: ascending
+
+    def test_tab_cycles_through_off(self):
+        self.assertEqual([tl.cycle_sort(c, 3, 1) for c in (None, 0, 1, 2)], [0, 1, 2, None])
+        self.assertEqual([tl.cycle_sort(c, 3, -1) for c in (None, 0, 2)], [2, None, 1])
+
+    def test_sort_off_restores_csv_order(self):
+        ds = self.devices([("sw10", "1"), ("sw2", "2"), ("sw1", "3")])
+        sorted_once = tl.sort_devices(ds, 0, False, {})
+        self.assertEqual([d.name for d in tl.sort_devices(ds, None, False, {})], ["sw10", "sw2", "sw1"])
+        self.assertNotEqual(sorted_once, ds)
+
     def test_sort_by_ping_down_first(self):
         ds = self.devices([("a", "1"), ("b", "2"), ("c", "3")])
         states = {"1": tl.PING_UP, "2": tl.PING_DOWN}
         self.assertEqual([d.name for d in tl.sort_devices(ds, 2, False, states)], ["b", "a", "c"])
+
+
+class TestSearchSyntax(unittest.TestCase):
+    def setUp(self):
+        headers = ["Name", "IP", "type", "aliases", "location"]
+        rows = [dict(zip(headers, r)) for r in (
+            ("ber-core-01", "10.0.0.1", "core", "Core Berlin", "Room 1"),
+            ("ber-edge-01", "10.0.0.2", "edge", "Edge Berlin", ""),
+            ("muc-core-01", "fe80::1", "core", "Core Munich", "Room 9"),
+            ("ber-test-01", "10.0.0.4", "edge", "Test", "Lab"))]
+        cfg = types.SimpleNamespace(host_column="IP", name_column="Name",
+                                    columns=[("Name", "Name"), ("IP", "IP"), ("aliases", "Alias")])
+        self.devices, columns, _ = tl.build_devices(headers, rows, cfg)
+        self.fields = dict((h.lower(), h) for h in headers)
+        self.fields.update((label.lower(), h) for h, label in columns)
+
+    def names(self, query, **kw):
+        return [d.name for d in tl.filter_devices(self.devices, query, self.fields, **kw)]
+
+    def test_field_hidden_column_and_label(self):
+        self.assertEqual(self.names("type:core"), ["ber-core-01", "muc-core-01"])
+        self.assertEqual(self.names("TYPE:CORE ber"), ["ber-core-01"])
+        self.assertEqual(self.names("alias:munich"), ["muc-core-01"])        # table label works too
+        self.assertEqual(self.names("location:"), ["ber-edge-01"])             # empty column
+
+    def test_negation(self):
+        self.assertEqual(self.names("ber -test"), ["ber-core-01", "ber-edge-01"])
+        self.assertEqual(self.names("-type:edge"), ["ber-core-01", "muc-core-01"])
+
+    def test_unknown_field_is_plain_text(self):
+        self.assertEqual(self.names("fe80::1"), ["muc-core-01"])                # IPv6 is not a field
+        self.assertEqual(self.names("nosuch:x"), [])
+
+    def test_ping_and_user_state(self):
+        ping = {"10.0.0.1": tl.PING_UP, "10.0.0.2": tl.PING_DOWN}
+        self.assertEqual(self.names("ping:down", ping=ping), ["ber-edge-01"])
+        self.assertEqual(self.names("ping:none", ping=ping), ["muc-core-01", "ber-test-01"])
+        self.assertEqual(self.names("-ping:up", ping=ping), ["ber-edge-01", "muc-core-01", "ber-test-01"])
+        self.assertEqual(self.names("is:fav", favorites={"ber-test-01"}), ["ber-test-01"])
+        self.assertEqual(self.names("is:recent", recent={"muc-core-01": 5}), ["muc-core-01"])
+
+    def test_default_order(self):
+        favorites, recent = {"muc-core-01"}, {"ber-edge-01": 10, "ber-test-01": 20}
+        order = [d.name for d in tl.default_order(self.devices, "", favorites, recent)]
+        self.assertEqual(order[0], "muc-core-01")                              # favourites pinned
+        order = [d.name for d in tl.default_order(self.devices, "is:recent", favorites, recent)]
+        self.assertEqual(order[:2], ["ber-test-01", "ber-edge-01"])            # newest first
+
+
+class TestUserState(TempDir):
+    def test_favorites_and_recent_persist(self):
+        st = tl.UserState(os.path.join(self.tmp, "state"))
+        self.assertTrue(st.toggle_favorite("sw1"))
+        st.touch("sw2")
+        again = tl.UserState(os.path.join(self.tmp, "state"))
+        self.assertEqual(again.favorites, {"sw1"})
+        self.assertIn("sw2", again.recent)
+        self.assertFalse(again.toggle_favorite("sw1"))
+        self.assertEqual(tl.UserState(os.path.join(self.tmp, "state")).favorites, set())
+        mode = os.stat(os.path.join(self.tmp, "state", "favorites")).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_history_is_trimmed_and_tolerates_garbage(self):
+        d = os.path.join(self.tmp, "state")
+        os.makedirs(d)
+        with open(os.path.join(d, "recent"), "w") as f:
+            f.write("garbage\nnot-a-number\tsw9\n100\tsw1\n")
+        self.assertEqual(tl.UserState(d).recent, {"sw1": 100.0})
+        with open(os.path.join(d, "recent"), "w") as f:
+            f.write("".join("%d\tx%d\n" % (i, i) for i in range(tl.UserState.MAX_RECENT + 20)))
+        tl.UserState(d).touch("newest")
+        self.assertEqual(len(tl.UserState(d).recent), tl.UserState.MAX_RECENT)
+        self.assertIn("newest", tl.UserState(d).recent)
+
+    def test_unwritable_directory_reports_error(self):
+        blocker = os.path.join(self.tmp, "file")
+        open(blocker, "w").close()
+        st = tl.UserState(os.path.join(blocker, "state"))     # a file is in the way
+        st.toggle_favorite("sw1")
+        self.assertIsNotNone(st.error)
+        self.assertEqual(st.favorites, {"sw1"})               # still works in memory
 
 
 class TestSecurityHelpers(unittest.TestCase):
@@ -211,6 +311,9 @@ class TestDrawingHelpers(unittest.TestCase):
     def test_fit_widths(self):
         self.assertEqual(sum(tl.fit_widths([40, 20, 6], 50)), 50)
         self.assertEqual(tl.fit_widths([10, 10], 50), [10, 10])
+
+    def test_wrap_words(self):
+        self.assertEqual(tl.wrap_words("* Login failed for timmy", 12, indent=2), ["* Login", "  failed for", "  timmy"])
 
     def test_wrap(self):
         self.assertEqual(tl.wrap_lines(["a" * 25, ""], 10), ["a" * 10, "a" * 10, "a" * 5, ""])

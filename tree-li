@@ -67,6 +67,7 @@ DEFAULTS = {
     "connect_timeout": "10",
     "session_log": "no",
     "log_dir": "~/.local/state/tree-li/logs",
+    "state_dir": "",
     "ping_workers": "64",
     "ping_timeout": "1",
     "trace_command": "auto",
@@ -198,6 +199,8 @@ def load_config(args):
     cfg.connect_timeout = parse_int(raw["connect_timeout"], "connect_timeout", 1, 300)
     cfg.session_log = args.log or parse_bool(raw["session_log"], "session_log")
     cfg.log_dir = os.path.abspath(os.path.expanduser(raw["log_dir"]))
+    state_home = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    cfg.state_dir = os.path.abspath(os.path.expanduser(raw["state_dir"] or os.path.join(state_home, "tree-li")))
     cfg.ping_workers = parse_int(raw["ping_workers"], "ping_workers", 1, 256)
     cfg.ping_timeout = parse_int(raw["ping_timeout"], "ping_timeout", 1, 30)
     cfg.trace_command = raw["trace_command"] or "auto"
@@ -325,12 +328,129 @@ def build_devices(headers, rows, cfg):
     return devices, columns, warns
 
 
-def filter_devices(devices, query):
-    """Whitespace separated tokens, all must match (case-insensitive substring)."""
-    tokens = query.lower().split()
-    if not tokens:
+def device_key(d):
+    """Identity used for favourites and history: the name, or the host without one."""
+    return d.name or d.host
+
+
+PING_NAMES = {PING_UP: "up", PING_DOWN: "down", PING_WAIT: "wait"}
+IS_FAVORITE = ("fav", "favs", "favorite", "favourite", "star")
+IS_RECENT = ("recent", "used", "history")
+
+
+def search_term(token, fields, ping, favorites, recent):
+    """One search word -> test function.  See filter_devices for the syntax."""
+    name, sep, value = token.partition(":")
+    if sep:
+        if name == "is" and value in IS_FAVORITE:
+            return lambda d: device_key(d) in favorites
+        if name == "is" and value in IS_RECENT:
+            return lambda d: device_key(d) in recent
+        if name == "ping":
+            return lambda d: PING_NAMES.get(ping.get(d.host), "none").startswith(value)
+        header = fields.get(name)
+        if header is not None:
+            if not value:
+                return lambda d: not d.values.get(header)
+            return lambda d: value in d.values.get(header, "").lower()
+    # plain word - also unknown "x:y" such as IPv6 addresses
+    return lambda d: token in d.search
+
+
+def filter_devices(devices, query, fields=None, ping=None, favorites=(), recent=None):
+    """Space separated terms, all must match, case-insensitive:
+         word          part of a visible column
+         field:value   part of that CSV column (header or table label), field: = empty
+         ping:down     ping state: up, down, wait, none
+         is:fav        favourites         is:recent   switches you connected to
+         -term         excludes, e.g. -test  -type:edge  -ping:up"""
+    tests = []
+    for token in query.lower().split():
+        negate = len(token) > 1 and token.startswith("-")
+        if negate:
+            token = token[1:]
+        tests.append((negate, search_term(token, fields or {}, ping or {}, favorites, recent or {})))
+    if not tests:
         return list(devices)
-    return [d for d in devices if all(t in d.search for t in tokens)]
+    return [d for d in devices if all(test(d) != negate for negate, test in tests)]
+
+
+def default_order(view, query, favorites, recent):
+    """Order without a chosen sort column: newest first for is:recent,
+    otherwise favourites pinned on top (both keep the CSV order otherwise)."""
+    if any(t in ["is:" + v for v in IS_RECENT] for t in query.lower().split()):
+        return sorted(view, key=lambda d: recent.get(device_key(d), 0), reverse=True)
+    return [d for d in view if device_key(d) in favorites] + [d for d in view if device_key(d) not in favorites]
+
+
+class UserState(object):
+    """Favourites and connection history of the current user, kept in
+    ~/.local/state/tree-li - never in the shared directory."""
+
+    MAX_RECENT = 200
+
+    def __init__(self, directory):
+        self.dir = directory
+        self.favorites = set()
+        self.recent = {}               # device key -> time of the last successful connection
+        self.error = None
+        self.load()
+
+    def _path(self, name):
+        return os.path.join(self.dir, name)
+
+    def load(self):
+        self.favorites = set(line.strip() for line in self._read("favorites") if line.strip())
+        self.recent = {}
+        for line in self._read("recent"):
+            stamp, _, key = line.rstrip("\n").partition("\t")
+            try:
+                if key:
+                    self.recent[key] = max(float(stamp), self.recent.get(key, 0))
+            except ValueError:
+                pass
+
+    def _read(self, name):
+        try:
+            with open(self._path(name), encoding="utf-8") as f:
+                return f.readlines()
+        except FileNotFoundError:
+            return []
+        except (OSError, UnicodeDecodeError) as e:
+            self.error = "cannot read %s: %s" % (self._path(name), e)
+            return []
+
+    def _write(self, name, lines):
+        path = self._path(name)
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        try:
+            os.makedirs(self.dir, mode=0o700, exist_ok=True)
+            with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+                f.write("".join(line + "\n" for line in lines))
+            os.replace(tmp, path)          # atomic: a crash never leaves half a file
+            self.error = None
+        except OSError as e:
+            self.error = "cannot save %s: %s" % (path, e.strerror or e)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def toggle_favorite(self, key):
+        self.load()                        # another TRee-Li of the same user may have changed it
+        if key in self.favorites:
+            self.favorites.discard(key)
+        else:
+            self.favorites.add(key)
+        self._write("favorites", sorted(self.favorites))
+        return key in self.favorites
+
+    def touch(self, key):
+        self.load()
+        self.recent[key] = time.time()
+        newest = sorted(self.recent.items(), key=lambda item: item[1], reverse=True)[:self.MAX_RECENT]
+        self.recent = dict(newest)
+        self._write("recent", ["%d\t%s" % (stamp, k) for k, stamp in reversed(newest)])
 
 
 def natural_key(text):
@@ -345,6 +465,22 @@ def natural_key(text):
 
 
 PING_RANK = {PING_DOWN: 0, PING_UP: 1, PING_WAIT: 2}
+
+
+def next_sort(sort_col, sort_desc, col):
+    """Pressing a column's sort key: ascending -> descending -> off (original order)."""
+    if sort_col != col:
+        return col, False
+    if not sort_desc:
+        return col, True
+    return None, False
+
+
+def cycle_sort(sort_col, ncols, step):
+    """Tab / Shift-Tab: through every column, then 'off' (None), then around again."""
+    order = list(range(ncols)) + [None]
+    position = order.index(sort_col) if sort_col in order else len(order) - 1
+    return order[(position + step) % len(order)]
 
 
 def sort_devices(devices, col, desc, ping_states):
@@ -916,6 +1052,18 @@ def fit_widths(widths, available, minimum=6):
     return widths
 
 
+def wrap_words(text, width, indent=0):
+    """Wrap at spaces; continuation lines are indented."""
+    lines, line = [], ""
+    for word in text.split(" "):
+        if line and len(line) + 1 + len(word) > width:
+            lines.append(line)
+            line = " " * indent + word
+        else:
+            line = (line + " " + word) if line else word
+    return lines + [line]
+
+
 def wrap_lines(lines, width):
     out = []
     width = max(10, width)
@@ -933,8 +1081,8 @@ def wrap_lines(lines, width):
 # Only characters present in the common PuTTY/Windows fonts (Consolas, Courier New, DejaVu).
 CHARSETS = {
     "unicode": {"hline": "─", "marker": "▌", "dot": "●", "prompt": "›", "up": "▲",
-                "down": "▼", "sep": "·", "lr": "←→", "ud": "↑↓", "mask": "•",
-                "box": "╭╮╰╯─│", "more": "…", "lt": "‹", "gt": "›",
+                "down": "▼", "sep": "·", "lr": "←→", "ud": "↑↓", "mask": "•", "box": "╭╮╰╯─│",
+                "more": "…", "lt": "‹", "gt": "›",
                 "track": "│", "thumb": "┃"},
     "ascii": {"hline": "-", "marker": ">", "dot": "*", "prompt": ">", "up": "^", "down": "v", "sep": "|",
               "lr": "<>", "ud": "Up/Dn", "mask": "*", "box": "++++-|", "more": "~", "lt": "<", "gt": ">",
@@ -951,44 +1099,61 @@ def detect_charset(setting):
 
 # name: ((fg, bg, flags) on 256-colour terminals, (fg, bg, flags) on 8-colour terminals)
 # -1 = the terminal's own colour, so light and dark terminal themes both work.
-# Flags: b = bold, d = dim, u = underline, r = reverse.  A broad range of blues as accents.
+# Flags: b = bold, d = dim, u = underline, r = reverse.
+#
+# Colours follow STYLE.md (TRee-Li palette), as xterm-256 numbers:
+#   Navy 18   TRee Blue 25   Signal Blue 26   Steel 67   Sky 111   Mist 189   Highlight 214
+# Light shades carry text on dark terminals, strong shades are used as backgrounds.
 PALETTE = {
-    "brand":       ((39, -1, "b"),  ("cyan", -1, "b")),
-    "brand_sub":   ((110, -1, ""),  (-1, -1, "")),
+    "brand":       ((111, -1, "b"), ("cyan", -1, "b")),
+    "brand_sub":   ((67, -1, ""),   (-1, -1, "")),
     "info":        ((67, -1, ""),   ("blue", -1, "b")),
-    "rule":        ((24, -1, ""),   ("blue", -1, "")),
-    "tab":         ((110, -1, ""),  ("cyan", -1, "")),
+    "rule":        ((25, -1, ""),   ("blue", -1, "")),
+    "tab":         ((111, -1, ""),  ("cyan", -1, "")),
     "tab_active":  ((231, 25, "b"), ("white", "blue", "b")),
-    "prompt":      ((39, -1, "b"),  ("cyan", -1, "b")),
-    "cursor":      ((17, 39, ""),   ("black", "cyan", "")),
-    "placeholder": ((60, -1, ""),   (-1, -1, "d")),
-    "head":        ((68, -1, "b"),  ("cyan", -1, "b")),
-    "sort":        ((39, -1, "b"),  ("cyan", -1, "b")),
+    "prompt":      ((111, -1, "b"), ("cyan", -1, "b")),
+    "cursor":      ((231, 26, ""),  ("black", "cyan", "")),
+    "placeholder": ((67, -1, ""),   (-1, -1, "d")),
+    "head":        ((111, -1, "b"), ("cyan", -1, "b")),
+    "sort":        ((189, -1, "b"), ("cyan", -1, "b")),
     "text":        ((-1, -1, ""),   (-1, -1, "")),
-    "sel":         ((231, 18, "b"), ("white", "blue", "b")),
-    "marker":      ((39, -1, "b"),  ("cyan", -1, "b")),
+    "sel":         ((231, 25, "b"), ("white", "blue", "b")),
+    "marker":      ((111, -1, "b"), ("cyan", -1, "b")),
     "up":          ((78, -1, "b"),  ("green", -1, "b")),
     "down":        ((203, -1, "b"), ("red", -1, "b")),
     "wait":        ((179, -1, ""),  ("yellow", -1, "")),
-    "up_sel":      ((78, 18, "b"),  ("green", "blue", "b")),
-    "down_sel":    ((203, 18, "b"), ("red", "blue", "b")),
-    "wait_sel":    ((179, 18, ""),  ("yellow", "blue", "")),
-    "key":         ((39, -1, "b"),  ("cyan", -1, "b")),
+    "up_sel":      ((120, 25, "b"), ("green", "blue", "b")),
+    "down_sel":    ((217, 25, "b"), ("red", "blue", "b")),
+    "wait_sel":    ((223, 25, ""),  ("yellow", "blue", "")),
+    "fav":         ((214, -1, "b"), ("yellow", -1, "b")),
+    "fav_sel":     ((214, 25, "b"), ("yellow", "blue", "b")),
+    "key":         ((111, -1, "b"), ("cyan", -1, "b")),
     "hint":        ((67, -1, ""),   ("blue", -1, "b")),
-    "msg":         ((117, -1, ""),  ("cyan", -1, "")),
+    "msg":         ((189, -1, ""),  ("cyan", -1, "")),
     "err":         ((203, -1, "b"), ("red", -1, "b")),
-    "border":      ((25, -1, ""),   ("blue", -1, "b")),
-    "field":       ((231, 237, ""), (-1, -1, "u")),
-    "banner1":     ((27, -1, "b"),  ("blue", -1, "b")),
-    "banner2":     ((33, -1, "b"),  ("blue", -1, "b")),
-    "banner3":     ((39, -1, "b"),  ("cyan", -1, "")),
-    "banner4":     ((45, -1, "b"),  ("cyan", -1, "b")),
-    "banner5":     ((81, -1, "b"),  ("cyan", -1, "b")),
+    # dialog windows: the screen behind fades a little, the window is a framed
+    # mid-blue panel with pale-blue input fields
+    "backdrop":    ((246, -1, ""),  ("blue", -1, "b")),
+    "win":         ((189, 67, ""),  ("white", "blue", "")),
+    "win_frame":   ((189, 67, ""),  ("cyan", "blue", "b")),
+    "win_title":   ((231, 67, "b"), ("white", "blue", "b")),
+    "win_hint":    ((189, 67, ""),  ("white", "blue", "")),
+    "win_key":     ((231, 67, "b"), ("white", "blue", "b")),
+    "win_label":   ((231, 67, "b"), ("white", "blue", "b")),
+    "win_err":     ((224, 67, "b"), ("yellow", "blue", "b")),
+    "field":       ((18, 189, ""),  ("black", "white", "")),
+    "field_idle":  ((18, 111, ""),  ("black", "cyan", "")),
+    "banner1":     ((25, -1, "b"),  ("blue", -1, "b")),
+    "banner2":     ((26, -1, "b"),  ("blue", -1, "b")),
+    "banner3":     ((67, -1, "b"),  ("cyan", -1, "")),
+    "banner4":     ((111, -1, "b"), ("cyan", -1, "b")),
+    "banner5":     ((189, -1, "b"), ("cyan", -1, "b")),
 }
 # Without colours: attributes only.
-MONO = {"brand": "b", "info": "d", "tab_active": "r", "prompt": "b", "cursor": "r", "placeholder": "d",
-        "head": "b", "sort": "b", "sel": "r", "marker": "b", "up": "b", "down": "b", "up_sel": "r",
-        "down_sel": "r", "wait_sel": "r", "key": "b", "hint": "d", "err": "b", "field": "u",
+MONO = {"fav": "b", "fav_sel": "r", "brand": "b", "info": "d", "tab_active": "r", "prompt": "b", "cursor": "r",
+        "placeholder": "d", "head": "b", "sort": "b", "sel": "r", "marker": "b", "up": "b", "down": "b",
+        "up_sel": "r", "down_sel": "r", "wait_sel": "r", "key": "b", "hint": "d", "err": "b", "field": "r",
+        "backdrop": "d", "win_title": "b", "win_label": "b", "win_key": "b", "win_err": "b", "field_idle": "u",
         "banner1": "b", "banner2": "b", "banner3": "b", "banner4": "b", "banner5": "b"}
 COLOR_NAMES = {"black": curses.COLOR_BLACK, "red": curses.COLOR_RED, "green": curses.COLOR_GREEN,
                "yellow": curses.COLOR_YELLOW, "blue": curses.COLOR_BLUE, "cyan": curses.COLOR_CYAN,
@@ -1058,11 +1223,15 @@ class App(object):
         self.ping = {}                 # host -> PING_UP / PING_DOWN / PING_WAIT
         self.batch = None
         self.creds = None              # (user, password or None) - memory only
+        self.state = UserState(cfg.state_dir)
+        self.fields = {}               # lower-case header / label -> CSV header (for field:value)
         self.last_user = cfg.user
         self.msg, self.msg_error, self.msg_until = "", False, 0
         self.load_error = None
         self.set_cursor(False)
         self.load()
+        if self.state.error:
+            self.message(self.state.error, error=True, seconds=15)
 
     # -- helpers ------------------------------------------------------------
 
@@ -1090,12 +1259,15 @@ class App(object):
             devices, columns, warns = build_devices(headers, rows, self.cfg)
         except DataError as e:
             self.load_error = str(e)
-            self.devices = []
+            self.devices = self.loaded = []
             self.columns = self.columns or list(self.cfg.columns)
             self.message(str(e), error=True, seconds=30)
         else:
             self.load_error = None
             self.devices, self.columns = devices, columns
+            self.loaded = devices          # CSV order, used when sorting is switched off
+            self.fields = dict((h.lower(), h) for h in headers)
+            self.fields.update((label.lower(), h) for h, label in columns)
             if warns:
                 self.message("; ".join(warns), error=True, seconds=15)
         self.widths = [min(40, max([len(label) + 2] + [len(d.cells[i]) for d in self.devices]))
@@ -1106,26 +1278,33 @@ class App(object):
         self.apply_sort(keep)
 
     def apply_sort(self, keep=None):
-        self.devices = sort_devices(self.devices, self.sort_col, self.sort_desc, self.ping)
+        self.devices = sort_devices(self.loaded, self.sort_col, self.sort_desc, self.ping)
         self.refilter(keep)
 
     def refilter(self, keep=None):
         keep = keep or self.selected()
-        self.view = filter_devices(self.devices, self.query)
+        state = self.state
+        view = filter_devices(self.devices, self.query, self.fields, self.ping, state.favorites, state.recent)
+        if self.sort_col is None:
+            view = default_order(view, self.query, state.favorites, state.recent)
+        self.view = view
         self.cursor = 0
         for i, d in enumerate(self.view):
             if d is keep:
                 self.cursor = i
                 break
 
-    def set_sort(self, col):
-        if col >= self.ncols():
+    def set_sort(self, col, desc=None):
+        """col None = original order.  Without desc: ascending -> descending -> off."""
+        if col is not None and col >= self.ncols():
             return
-        if self.sort_col == col:
-            self.sort_desc = not self.sort_desc
+        if desc is None:
+            self.sort_col, self.sort_desc = next_sort(self.sort_col, self.sort_desc, col)
         else:
-            self.sort_col, self.sort_desc = col, False
+            self.sort_col, self.sort_desc = col, desc
         self.apply_sort()
+        if self.sort_col is None:
+            self.message("Original order")
 
     def sync_size(self):
         size = terminal_size()
@@ -1144,11 +1323,11 @@ class App(object):
     #   ›  ber core                                                              search
     #    NAME          IP           ...                              PING        table head
     #    ────────────────────────────────────────────────────────────────        rule
-    #  ▌ ber-core-01   192.0.2.1    ...                              ● up        rows
+    #  ▌* ber-core-01  192.0.2.1    ...                              ● up        rows
     # ───────────────────────────────────────────────────────────────────────  rule
     #  Enter run  ←→ command  type search  F1-F6 sort  ^R reload  ^C quit        footer
 
-    TABLE_X = 3          # column 1 holds the selection marker
+    TABLE_X = 4          # column 1: selection marker, column 2: favourite star
 
     def layout(self):
         h, w = self.scr.getmaxyx()
@@ -1207,7 +1386,7 @@ class App(object):
         batch = ""
         if self.batch and self.batch.running:
             batch = "batch ping %d/%d %s ESC cancels" % (self.batch.done, self.batch.total, sym["sep"])
-        hints = [("Enter", "run"), (sym["lr"], "command"), ("type", "search"),
+        hints = [("Enter", "run"), (sym["lr"], "command"), ("^F", "favourite"),
                  ("F1-F%d" % self.ncols(), "sort"), ("^R", "reload"), ("^C", "quit")]
         self.draw_frame("Switch Manager", right, hints=hints, footer_right=batch, footer_attr=th.wait)
 
@@ -1222,13 +1401,24 @@ class App(object):
             put(scr, y_tabs, 4, " %s " % COMMANDS[self.cmd], th.tab_active)
             put(scr, y_tabs, 7 + len(COMMANDS[self.cmd]), sym["gt"], th.tab)
 
-        # search
+        # search: "-" and "field:" parts of terms are highlighted
         put(scr, y_search, 2, sym["prompt"], th.prompt)
         shown = self.query[-(w - 9):]
-        put(scr, y_search, 5, shown, th.text)
-        put(scr, y_search, 5 + len(shown), " ", th.cursor)
+        x = 5
+        for part in re.split(r"(\s+)", shown):
+            neg = part[:1] if len(part) > 1 and part.startswith("-") else ""
+            name, sep, value = part[len(neg):].partition(":")
+            if sep and (name.lower() in self.fields or name.lower() in ("is", "ping")):
+                pieces = [(neg, th.err), (name + sep, th.key), (value, th.text)]
+            else:
+                pieces = [(neg, th.err), (part[len(neg):], th.text)]
+            for text, attr in pieces:
+                put(scr, y_search, x, text, attr)
+                x += len(text)
+        put(scr, y_search, x, " ", th.cursor)
         if not self.query:
-            put(scr, y_search, 7, "type to search %s all words must match" % sym["sep"], th.placeholder)
+            put(scr, y_search, 7, "type to search %s type:core  -test  ping:down  is:fav  is:recent" % sym["sep"],
+                th.placeholder)
 
         # table head
         x0 = self.TABLE_X
@@ -1275,6 +1465,8 @@ class App(object):
             if sel:
                 put(scr, y, 1, sym["marker"], th.marker)
                 put(scr, y, 2, " " * (w - 4), th.sel)
+            if device_key(d) in self.state.favorites:
+                put(scr, y, 2, "*", th.fav_sel if sel else th.fav)
             x = x0
             for i, value in enumerate(d.cells):
                 put(scr, y, x, fit(value, widths[i], sym["more"]), th.sel if sel else th.text)
@@ -1340,10 +1532,8 @@ class App(object):
             return self.execute()
         elif key.startswith("F") and key[1:].isdigit():
             self.set_sort(int(key[1:]) - 1)
-        elif key == "TAB":
-            self.set_sort(0 if self.sort_col is None else (self.sort_col + 1) % self.ncols())
-        elif key == "BTAB":
-            self.set_sort((self.ncols() - 1) if self.sort_col is None else (self.sort_col - 1) % self.ncols())
+        elif key in ("TAB", "BTAB"):
+            self.set_sort(cycle_sort(self.sort_col, self.ncols(), 1 if key == "TAB" else -1), desc=False)
         elif key == "BACKSPACE":
             if self.query:
                 self.query = self.query[:-1]
@@ -1362,6 +1552,17 @@ class App(object):
             elif self.query:
                 self.query = ""
                 self.refilter()
+            elif self.sort_col is not None:  # second ESC: back to the original order
+                self.set_sort(None, desc=False)
+        elif key == "CTRL_F":
+            dev = self.selected()
+            if dev is not None:
+                added = self.state.toggle_favorite(device_key(dev))
+                if self.state.error:
+                    self.message(self.state.error, error=True, seconds=10)
+                else:
+                    self.message("%s %s favourites" % (dev.name, "added to" if added else "removed from"))
+                self.refilter(dev)
         elif key == "CTRL_R":
             self.load()
             if not self.load_error:
@@ -1497,7 +1698,12 @@ class App(object):
 
     def show_details(self, dev):
         th = self.th
-        values = list(dev.values.items()) + [(PING_LABEL, self.ping.get(dev.host, "not checked"))]
+        last = self.state.recent.get(device_key(dev))
+        values = list(dev.values.items()) + [
+            (PING_LABEL, PING_NAMES.get(self.ping.get(dev.host), "not checked")),
+            ("Favourite", "yes" if device_key(dev) in self.state.favorites else "no  (Ctrl-F)"),
+            ("Last connected", time.strftime("%Y-%m-%d %H:%M", time.localtime(last)) if last else "never"),
+        ]
         width = max(len(k) for k, _ in values)
         lines = [[(k.ljust(width), th.head), ("   ", th.text), (v, th.text)] for k, v in values]
         self.show_text("details %s %s" % (self.th.sym["sep"], dev.name), lines=lines)
@@ -1520,10 +1726,20 @@ class App(object):
         item("Left Right", "select a command")
         item("Enter", "run the selected command")
         item("just type", "search - several words must all match")
-        item("Backspace  Ctrl-U  ESC", "edit / clear the search")
-        item("F1..F%d  Tab  Shift-Tab" % self.ncols(), "sort by column (same key again = reverse)")
+        item("Backspace  Ctrl-U  ESC", "edit / clear the search (ESC again: clear the sort)")
+        item("Ctrl-F", "mark / unmark the switch as favourite (*)")
+        item("F1..F%d" % self.ncols(), "sort by column: press again for reverse, a third time for off")
+        item("Tab  Shift-Tab", "next / previous sort column, then off")
         item("Ctrl-R", "reload the switch list")
         item("Ctrl-C", "quit")
+        section("Search")
+        item("ber core", "all words must match (visible columns)")
+        item("type:core  responsible:timmy", "a CSV column, also ones not shown in the table")
+        item("location:", "column is empty")
+        item("-test  -type:edge", "exclude")
+        item("ping:down", "ping state: up, down, wait, none")
+        item("is:fav", "your favourites (always listed first)")
+        item("is:recent", "switches you connected to, newest first")
         section("Commands")
         item("ssh", "connect - user/password are asked once and kept")
         item("", "in memory only. Log out of the switch to come back.")
@@ -1542,6 +1758,31 @@ class App(object):
         lines += [[], [("Inspired by V-Li: Switch Manager (Franz, 2025).", th.hint)]]
         self.show_text("help", lines=lines)
 
+    # -- dialog windows -----------------------------------------------------
+
+    def draw_window(self, title, subtitle, bh, bw):
+        """Main screen slightly faded, then an empty framed window of bh x bw,
+        centred, with the title in the top frame line.  Returns its top-left corner."""
+        scr, th = self.scr, self.th
+        tl, tr, bl, br, hl, vl = th.sym["box"]
+        self.draw(refresh=False)
+        h, w = scr.getmaxyx()
+        for y in range(h):                       # fade what is behind the window
+            try:
+                scr.chgat(y, 0, w - 1 if y == h - 1 else -1, th.backdrop)
+            except curses.error:
+                pass
+        y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+        put(scr, y0, x0, tl + hl * (bw - 2) + tr, th.win_frame)
+        for y in range(y0 + 1, y0 + bh - 1):
+            put(scr, y, x0, vl + " " * (bw - 2) + vl, th.win_frame)
+            put(scr, y, x0 + 1, " " * (bw - 2), th.win)
+        put(scr, y0 + bh - 1, x0, bl + hl * (bw - 2) + br, th.win_frame)
+        put(scr, y0, x0 + 2, " %s " % title, th.win_title)
+        if subtitle:
+            put(scr, y0, x0 + 4 + len(title), "%s %s " % (th.sym["sep"], subtitle), th.win_frame)
+        return y0, x0
+
     # -- credentials --------------------------------------------------------
 
     def credential_dialog(self, error=None):
@@ -1549,38 +1790,30 @@ class App(object):
         user, pw = self.last_user or "", ""
         field = 1 if user else 0
         scr, th, sym = self.scr, self.th, self.th.sym
-        tl, tr, bl, br, hl, vl = sym["box"]
         while True:
-            self.draw(refresh=False)
-            h, w = scr.getmaxyx()
-            bw, bh = min(62, w - 4), 13
-            y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+            bw, bh = min(62, scr.getmaxyx()[1] - 6), 13
+            y0, x0 = self.draw_window("Login", "asked once per session", bh, bw)
             fw = max(6, bw - 18)
-
-            title = " Login "
-            put(scr, y0, x0, tl + hl + title + hl * (bw - 3 - len(title)) + tr, th.border)
-            put(scr, y0, x0 + 2, title, th.brand)
-            for i in range(1, bh - 1):
-                put(scr, y0 + i, x0, vl + " " * (bw - 2) + vl, th.border)
-                put(scr, y0 + i, x0 + 1, " " * (bw - 2), th.text)
-            put(scr, y0 + bh - 1, x0, bl + hl * (bw - 2) + br, th.border)
 
             values = [user, sym["mask"] * len(pw)]
             for i, label in enumerate(("Username", "Password")):
                 y = y0 + 2 + i * 2
-                put(scr, y, x0 + 3, label, th.prompt if field == i else th.hint)
+                active = field == i
+                put(scr, y, x0 + 3, label, th.win_label if active else th.win)
                 shown = values[i][-(fw - 2):]
-                put(scr, y, x0 + 14, " " + shown.ljust(fw - 1), th.field)
-                if field == i:
+                put(scr, y, x0 + 14, " " + shown.ljust(fw - 1), th.field if active else th.field_idle)
+                if active:
                     put(scr, y, x0 + 15 + len(shown), " ", th.cursor)
             if error:
-                put(scr, y0 + 6, x0 + 3, (sym["dot"] + " " + error)[:bw - 6], th.err)
-            put(scr, y0 + 8, x0 + 3, ("Kept in memory only %s forgotten when TRee-Li exits" % sym["sep"])[:bw - 6], th.hint)
-            put(scr, y0 + 9, x0 + 3, "Empty password: ssh asks at every login"[:bw - 6], th.hint)
+                for i, line in enumerate(wrap_words(sym["dot"] + " " + error, bw - 6, indent=2)[:2]):
+                    put(scr, y0 + 6 + i, x0 + 3, line, th.win_err)
+            put(scr, y0 + 8, x0 + 3, ("Kept in memory only %s forgotten when TRee-Li exits" % sym["sep"])[:bw - 6],
+                th.win_hint)
+            put(scr, y0 + 9, x0 + 3, "Empty password: ssh asks at every login"[:bw - 6], th.win_hint)
             x = x0 + 3
             for key, label in (("Enter", "OK"), ("Tab", "next field"), ("ESC", "cancel")):
-                put(scr, y0 + 11, x, key, th.key)
-                put(scr, y0 + 11, x + len(key) + 1, label, th.hint)
+                put(scr, y0 + 11, x, key, th.win_key)
+                put(scr, y0 + 11, x + len(key) + 1, label, th.win_hint)
                 x += len(key) + len(label) + 4
             scr.refresh()
 
@@ -1638,6 +1871,7 @@ class App(object):
             if result.hostkey_changed:
                 self.message("%s: host key changed - not connected" % dev.name, error=True, seconds=15)
             elif not result.failed:
+                self.state.touch(device_key(dev))
                 self.message("Disconnected from %s" % dev.name)
             else:
                 text = "%s: ssh exit code %d" % (dev.name, result.exit_code)

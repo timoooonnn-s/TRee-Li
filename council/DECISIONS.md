@@ -62,3 +62,23 @@ The command is `tree-li` (`tree` already exists on Linux, so the hyphenated name
 - **Switch list:** `● up` / `● down` coloured dots, a `▌` selection marker, a scrollbar for long lists.
 - *Critic:* Unicode only for characters in common Windows fonts, and an automatic ASCII fallback (`charset`, `--ascii`). Python's C-locale coercion reports UTF-8 even under `LANG=C`, so the manual switch is the real escape hatch.
 - *Operator:* the login dialog draws its own block cursor instead of relying on the terminal cursor (PuTTY often hides that).
+
+## D12: Search syntax, favourites, history (2026-10-02)
+- Search terms: `word`, `field:value` (any CSV column or table label, `field:` = empty), `ping:up|down|wait|none`, `is:fav`, `is:recent`, and `-term` to negate. Unknown `x:y` is treated as plain text, so IPv6 addresses (`fe80::1`) keep working (*Critic*).
+- The favourite key is **Ctrl-F**, not `*`: every printable key belongs to the search (*Operator*).
+- Without a chosen sort column, favourites are pinned on top and `is:recent` orders newest first. Choosing a sort column (F1-F6) always wins, because otherwise "sort by Ping" would be confusing (*Operator*).
+- Stored per user in `~/.local/state/tree-li/{favorites,recent}`: mode 0600, atomic writes, re-read before every write (two TRee-Li windows of the same user don't overwrite each other), history capped at 200. Only successful logins are recorded (*Warden*).
+
+## D13: Dialog windows and the TRee-Li palette (user request, 2026-10-02)
+- First version (dark navy panel, strong grey-out, drop shadow) was rejected as too dark.
+- Now: the screen behind a dialog only **fades a bit** (grey 246), there is **no shadow**, and the window is a **lighter mid-blue panel** with a thin rounded **frame** that carries the title (`╭─ Login · asked once per session ─╮`). The input fields are pale blue, and the active one is the lightest.
+- The whole UI uses one blue palette with several shades (the user's choice), defined in `STYLE.md`. Light shades carry text on dark terminals; strong shades are backgrounds (tab, selection bar, panel).
+- Small, obvious highlights stay bright and off-palette on purpose: the favourite star is orange (214) and ping status is green/red.
+- `draw_window()` is generic, so future dialogs look the same.
+- 8 colours: blue panel, cyan frame, white hint text, white/cyan input fields, background faded to bright blue.
+- Rule: no third-party brand names in the project.
+
+## D14: Sorting can be switched off (user feedback, 2026-10-02)
+- Problem: once sorted, there was no way back. The list was re-sorted in place, so the CSV order was lost.
+- Now: the same F-key cycles ascending ▲ → descending ▼ → off. `Tab`/`Shift-Tab` go through all columns and then "off". `ESC` with an empty search also switches sorting off. "Off" shows the CSV order again, favourites pinned on top (*Operator*).
+- The loaded CSV order is kept separately (`App.loaded`), so "off" is exact, not "whatever the last sort left behind" (*Critic*).

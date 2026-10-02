@@ -43,6 +43,10 @@
 #session_log = no
 #log_dir = ~/.local/state/tree-li/logs
 
+# Where your favourites and connection history are kept (per user).
+# Default: $XDG_STATE_HOME/tree-li or ~/.local/state/tree-li
+#state_dir =
+
 # Batch ping: parallel pings and seconds to wait for each reply.
 #ping_workers = 64
 #ping_timeout = 1

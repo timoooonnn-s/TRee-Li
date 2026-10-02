@@ -51,13 +51,38 @@ font or a non-UTF-8 character set), start with `--ascii` or set `charset = ascii
 | `Up` `Down` `PgUp` `PgDn` `Home` `End` | select a switch |
 | `Left` `Right` | select a command |
 | `Enter` | run the selected command on the selected switch |
-| just type | search. All words must match (`ber core` finds Berlin core switches) |
-| `Backspace`, `Ctrl-U`, `ESC` | edit / clear the search (`ESC` also cancels a running batch ping) |
-| `F1`...`F6`, or `Tab` / `Shift-Tab` | sort by column (press the same F-key again to reverse) |
+| just type | search. All words must match (`ber core` finds Berlin core switches); see [Search](#search) |
+| `Backspace`, `Ctrl-U`, `ESC` | edit / clear the search. `ESC` again (search empty) clears the sort. `ESC` also cancels a running batch ping |
+| `F1`...`F6` | sort by column: press once for ▲ ascending, again for ▼ descending, a third time for the original order |
+| `Tab` / `Shift-Tab` | next / previous sort column, after the last one: original order |
+| `Ctrl-F` | mark / unmark the selected switch as a favourite (`*`) |
 | `Ctrl-R` | reload the switch list |
 | `Ctrl-C` | quit |
 
 In output windows (ping, traceroute, details, help): arrow keys and `PgUp`/`PgDn` scroll, and `ESC` / `Enter` / `q` closes.
+
+## Search
+
+| You type | Shows |
+|---|---|
+| `ber core` | switches where every word appears in a visible column |
+| `type:core` | the CSV column `type` contains "core". Works for **every** CSV column, also ones not shown in the table, and for table labels (`alias:munich`) |
+| `location:` | the column is empty |
+| `-test`, `-type:edge` | excludes matches |
+| `ping:down` | ping state `up`, `down`, `wait` or `none` (not pinged yet) |
+| `is:fav` | your favourites |
+| `is:recent` | switches you connected to, most recent first |
+
+Terms can be combined: `type:core -ber ping:down` shows core switches outside Berlin that didn't answer.
+
+## Favourites and recent switches
+
+- `Ctrl-F` marks the selected switch as a favourite. Favourites get an orange `*` and are listed **first**
+  (as long as no sort column is chosen with F1-F6).
+- Every successful ssh login is remembered. `is:recent` lists those switches, newest first, and
+  **details** shows "Last connected".
+- Both are **per user** in `~/.local/state/tree-li/` (`favorites`, `recent`, mode 0600), never in the shared directory
+  or the CSV. Colleagues each have their own.
 
 ## Commands
 
@@ -163,6 +188,8 @@ Be aware that commands like `show running-config` can include secrets.
 | Check everything at once | `tree-li --check` |
 
 ## Development
+
+Colours, symbols and layout rules: [STYLE.md](STYLE.md).
 
 ```bash
 python3 -m unittest discover -s tests -v

@@ -16,12 +16,25 @@
 - [x] Redesign per D11; verified in 256 colours, 8 colours and ASCII
 - [x] Restored `.gitignore` / `.gitattributes` (missing from the first push!)
 
+## Milestone 1c: brainstorm picks #1 + #2. DONE (2026-10-02)
+- [x] Search filters (D12), highlighted in the search line, documented in help + README
+- [x] Favourites (Ctrl-F, pinned, `is:fav`) and history (`is:recent`, "Last connected" in details)
+- [x] 46 tests
+
 ## Milestone 2: field test (needs the user)
 - [ ] Run `./tree-li --check` on the RHEL server
 - [ ] ssh into a real Extreme Fabric Engine switch: password prompt detected? logout returns to the menu?
 - [ ] Try a wrong password once: one attempt only, then asked again
 - [ ] Try it from PuTTY (F-keys, colours, Unicode lines) and from Tabby
 - [ ] Batch ping over all ~700 switches: duration acceptable?
+
+## Backlog (brainstorm, not yet chosen)
+- #3 tmux: ssh in new tmux windows (needs a private password hand-over socket)
+- #4 data checks in `--check` + startup hint (duplicates, column count, invalid IPs)
+- #5 wrong-IP warning (prompt hostname vs CSV name)
+- #6/#7 run show commands on many switches / config backup (read-only by default)
+- #8 LLDP neighbours, #9 live monitor, #10 idle password timeout, #11 personal connection log
+- Tree view by site, mouse support, copy IP, CSV export
 
 ## Backlog (only if asked)
 - Extra CSV columns (location, ...): configure `columns`, no code change needed
