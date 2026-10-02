@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import types
 import unittest
 
@@ -124,7 +125,8 @@ class TestSearchSort(unittest.TestCase):
         for name, ip in rows:
             d = tl.Device()
             d.values, d.host, d.name, d.cells = {}, ip, name, [name, ip]
-            d.search = "\x00".join(d.cells).lower()
+            d.lcells = [c.lower() for c in d.cells]
+            d.search = "\x00".join(d.lcells)
             out.append(d)
         return out
 
@@ -165,7 +167,9 @@ class TestSearchSort(unittest.TestCase):
     def test_sort_by_ping_down_first(self):
         ds = self.devices([("a", "1"), ("b", "2"), ("c", "3")])
         states = {"1": tl.PING_UP, "2": tl.PING_DOWN}
-        self.assertEqual([d.name for d in tl.sort_devices(ds, 2, False, states)], ["b", "a", "c"])
+        self.assertEqual([d.name for d in tl.sort_devices(ds, 2, False, [states, {}])], ["b", "a", "c"])
+        ssh = {"1": tl.SSH_OPEN, "3": tl.SSH_CLOSED}
+        self.assertEqual([d.name for d in tl.sort_devices(ds, 3, False, [states, ssh])], ["c", "a", "b"])
 
 
 class TestSearchSyntax(unittest.TestCase):
@@ -200,12 +204,32 @@ class TestSearchSyntax(unittest.TestCase):
         self.assertEqual(self.names("nosuch:x"), [])
 
     def test_ping_and_user_state(self):
-        ping = {"10.0.0.1": tl.PING_UP, "10.0.0.2": tl.PING_DOWN}
-        self.assertEqual(self.names("ping:down", ping=ping), ["ber-edge-01"])
-        self.assertEqual(self.names("ping:none", ping=ping), ["muc-core-01", "ber-test-01"])
-        self.assertEqual(self.names("-ping:up", ping=ping), ["ber-edge-01", "muc-core-01", "ber-test-01"])
+        ping = {"status": {"ping": {"10.0.0.1": tl.PING_UP, "10.0.0.2": tl.PING_DOWN}}}
+        self.assertEqual(self.names("ping:down", **ping), ["ber-edge-01"])
+        self.assertEqual(self.names("ping:none", **ping), ["muc-core-01", "ber-test-01"])
+        self.assertEqual(self.names("-ping:up", **ping), ["ber-edge-01", "muc-core-01", "ber-test-01"])
+        ssh = {"status": {"ssh": {"10.0.0.1": tl.SSH_OPEN, "10.0.0.2": tl.SSH_SILENT}}}
+        self.assertEqual(self.names("ssh:no", **ssh), ["ber-edge-01"])         # "no answer", not "none"
+        self.assertEqual(self.names("ssh:none", **ssh), ["muc-core-01", "ber-test-01"])
         self.assertEqual(self.names("is:fav", favorites={"ber-test-01"}), ["ber-test-01"])
         self.assertEqual(self.names("is:recent", recent={"muc-core-01": 5}), ["muc-core-01"])
+        self.assertEqual(self.names("is:favs", favorites={"ber-test-01"}), [])  # no hidden aliases
+        self.assertEqual(self.names("ping:wait", status={"ping": {"10.0.0.4": tl.WAIT}}), ["ber-test-01"])
+
+    def test_fuzzy_and_exact(self):
+        self.assertEqual(self.names("bc01"), ["ber-core-01"])                  # b..c..01 in order
+        self.assertEqual(self.names("bt"), ["ber-test-01"])                    # b..t only in ber-test-01
+        self.assertEqual(self.names("'bc01"), [])                              # exact: not a substring
+        self.assertEqual(self.names("'core ber"), ["ber-core-01"])
+        self.assertEqual(self.names("-tst"), self.names(""))                   # excludes are exact
+
+    def test_fuzzy_ranking_and_marks(self):
+        found = {}
+        view = tl.filter_devices(self.devices, "core", self.fields, found=found)
+        order = [d.name for d in tl.default_order(view, "core", set(), {}, found)]
+        self.assertEqual(order, ["ber-core-01", "muc-core-01"])
+        d = next(d for d in view if d.name == "ber-core-01")
+        self.assertEqual(found[d][1], {0: {4, 5, 6, 7}})                      # "core" in the Name column
 
     def test_default_order(self):
         favorites, recent = {"muc-core-01"}, {"ber-edge-01": 10, "ber-test-01": 20}
@@ -213,6 +237,21 @@ class TestSearchSyntax(unittest.TestCase):
         self.assertEqual(order[0], "muc-core-01")                              # favourites pinned
         order = [d.name for d in tl.default_order(self.devices, "is:recent", favorites, recent)]
         self.assertEqual(order[:2], ["ber-test-01", "ber-edge-01"])            # newest first
+
+
+class TestFuzzyMatch(unittest.TestCase):
+    def test_match_and_positions(self):
+        self.assertEqual(tl.fuzzy_match("bc01", "ber-core-01")[1], (0, 4, 9, 10))
+        self.assertIsNone(tl.fuzzy_match("cb", "ber-core-01"))                 # order matters
+        self.assertEqual(tl.fuzzy_match("core", "ber-core-01")[1], (4, 5, 6, 7))
+
+    def test_scores(self):
+        exact = tl.fuzzy_match("core", "ber-core-01")[0]
+        scattered = tl.fuzzy_match("cr01", "ber-core-01")[0]
+        boundary = tl.fuzzy_match("bc", "ber-core-01")[0]
+        middle = tl.fuzzy_match("ro", "ber-core-01")[0]
+        self.assertGreater(exact, scattered)                                   # substring always wins
+        self.assertGreater(boundary, middle)                                   # word starts score higher
 
 
 class TestUserState(TempDir):
@@ -312,9 +351,6 @@ class TestDrawingHelpers(unittest.TestCase):
         self.assertEqual(sum(tl.fit_widths([40, 20, 6], 50)), 50)
         self.assertEqual(tl.fit_widths([10, 10], 50), [10, 10])
 
-    def test_wrap_words(self):
-        self.assertEqual(tl.wrap_words("* Login failed for timmy", 12, indent=2), ["* Login", "  failed for", "  timmy"])
-
     def test_wrap(self):
         self.assertEqual(tl.wrap_lines(["a" * 25, ""], 10), ["a" * 10, "a" * 10, "a" * 5, ""])
 
@@ -325,7 +361,6 @@ class TestProcStream(unittest.TestCase):
         for _ in range(100):
             if s.done:
                 break
-            import time
             time.sleep(0.05)
         self.assertTrue(s.done)
         self.assertEqual(s.returncode, 0)

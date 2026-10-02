@@ -51,6 +51,11 @@
 #ping_workers = 64
 #ping_timeout = 1
 
+# Batch ping also checks SSH: port, and seconds to wait for the server's greeting.
+# (If your switches use another SSH port, set it in ssh_options as well: -p 2222)
+#ssh_port = 22
+#ssh_check_timeout = 3
+
 # "auto" uses traceroute if installed, otherwise tracepath.
 #trace_command = auto
 

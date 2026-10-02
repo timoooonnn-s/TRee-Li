@@ -82,3 +82,19 @@ The command is `tree-li` (`tree` already exists on Linux, so the hyphenated name
 - Problem: once sorted, there was no way back. The list was re-sorted in place, so the CSV order was lost.
 - Now: the same F-key cycles ascending ▲ → descending ▼ → off. `Tab`/`Shift-Tab` go through all columns and then "off". `ESC` with an empty search also switches sorting off. "Off" shows the CSV order again, favourites pinned on top (*Operator*).
 - The loaded CSV order is kept separately (`App.loaded`), so "off" is exact, not "whatever the last sort left behind" (*Critic*).
+
+## D15: Second review round (2026-10-02)
+- **Kept on purpose (user):** `←` on "ssh" wraps around to "exit". The user sees it as a feature.
+- **ESC order** is now search → batch ping → sort, so clearing a search never kills a running batch ping. The footer only offers "ESC cancels" while the search is empty, and hides the batch counter once cancelled.
+- A fresh login shows up in `is:recent` at once. A ping result (single or batch) re-sorts a Ping-sorted list and updates `ping:` searches (`ping_changed()`).
+- A ping closed early still counts as "up" if a reply already came back.
+- Consolidated: ping states are stored as the words shown and searched (`up`/`down`/`wait`; the three translation tables are gone); stdlib `textwrap` replaces the hand-written word wrapper; the hidden search aliases (`is:favs`, `is:star`, `is:history`, ...) are gone. Only the documented `is:fav` / `is:recent` remain.
+
+## D16: Fuzzy search and SSH check (user request, 2026-10-02)
+- **Fuzzy search, fzf-style (user's choice):** plain words match when their letters appear in order within one visible column. A substring always outranks a scattered match; word starts and adjacent letters score higher. Without a sort column, the best matches come first (favourites win ties). Matched letters are underlined.
+  - `'word` forces an exact match.
+  - Excludes (`-word`), `field:value` and status filters stay exact. A fuzzy exclude would hide far too much (*Critic*).
+- **SSH check (user's choice: separate column, inside batch ping):** TCP connect to `ssh_port` (22) and wait for the server's `SSH-` greeting. If the server waits for the client, TRee-Li sends its own greeting first. Results: `open`, `closed` (refused), `no answer` (timeout, unreachable, no SSH greeting). No login, no password (*Warden*); the switch only logs a short connection.
+  - Ping and SSH run as separate tasks in the same worker pool, so a host with ICMP filtered can still show `ssh open`.
+  - `ssh:no` matches "no answer" but not unchecked hosts (`none`), because status filters treat `none` specially (*Critic*).
+- Sorting by PING/SSH puts problems first.

@@ -6,7 +6,7 @@ TRee-Li: Switch Manager
 A terminal (curses) switch manager for use over plain SSH sessions.
 Inspired by V-Li: Switch Manager (github.com/seismicindustries/switch-manager).
 
-Python 3.6+, standard library only.  Run `tree-li --help`.
+Python 3.8+, standard library only.  Run `tree-li --help`.
 """
 
 import argparse
@@ -27,10 +27,12 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
 import termios
+import textwrap
 import threading
 import time
 import tty
@@ -43,8 +45,14 @@ CONFIG_NAME = "tree-li.conf"
 CONFIG_SECTION = "tree-li"
 COMMANDS = ["ssh", "ping", "traceroute", "batch ping", "details", "help", "exit"]
 
-PING_UP, PING_DOWN, PING_WAIT = "UP", "DOWN", "..."
-PING_LABEL = "Ping"
+# Status words are stored, shown and searched as they are (ping:down, ssh:closed).
+PING_UP, PING_DOWN, WAIT = "up", "down", "wait"
+SSH_OPEN, SSH_CLOSED, SSH_SILENT = "open", "closed", "no answer"
+STATUS_LABELS = ["Ping", "SSH"]                         # the two status columns after the CSV columns
+STATUS_WIDTHS = [6, 11]                                 # "* down", "* no answer"
+STATUS_RANK = {PING_DOWN: 0, SSH_CLOSED: 0, SSH_SILENT: 1, PING_UP: 2, SSH_OPEN: 2, WAIT: 3}
+STATUS_STYLE = {PING_UP: "up", SSH_OPEN: "up", PING_DOWN: "down", SSH_CLOSED: "down",
+                SSH_SILENT: "down", WAIT: "wait"}
 
 # fork() while batch-ping threads run raises a DeprecationWarning on Python 3.12+.
 # The child execs immediately, so it is safe; the warning would only garble the screen.
@@ -70,6 +78,8 @@ DEFAULTS = {
     "state_dir": "",
     "ping_workers": "64",
     "ping_timeout": "1",
+    "ssh_port": "22",
+    "ssh_check_timeout": "3",
     "trace_command": "auto",
     "charset": "auto",
 }
@@ -86,7 +96,7 @@ class DataError(Exception):
 
 
 class Config(object):
-    """Resolved settings; see tree-li.conf for documentation of every option."""
+    """Resolved settings; every option is documented in tree-li.conf.example."""
 
 
 def parse_bool(value, option):
@@ -203,6 +213,8 @@ def load_config(args):
     cfg.state_dir = os.path.abspath(os.path.expanduser(raw["state_dir"] or os.path.join(state_home, "tree-li")))
     cfg.ping_workers = parse_int(raw["ping_workers"], "ping_workers", 1, 256)
     cfg.ping_timeout = parse_int(raw["ping_timeout"], "ping_timeout", 1, 30)
+    cfg.ssh_port = parse_int(raw["ssh_port"], "ssh_port", 1, 65535)
+    cfg.ssh_check_timeout = parse_int(raw["ssh_check_timeout"], "ssh_check_timeout", 1, 30)
     cfg.trace_command = raw["trace_command"] or "auto"
     charset = "ascii" if args.ascii else (raw["charset"] or "auto").lower()
     if charset not in ("auto", "unicode", "ascii"):
@@ -282,7 +294,7 @@ def read_table(path, delimiter=None):
 
 
 class Device(object):
-    __slots__ = ("values", "host", "name", "cells", "search")
+    __slots__ = ("values", "host", "name", "cells", "lcells", "search")
 
 
 def find_header(headers, wanted):
@@ -323,7 +335,8 @@ def build_devices(headers, rows, cfg):
         d.host = row.get(host_h, "")
         d.name = row.get(name_h, "") or d.host
         d.cells = [row.get(h, "") for h, _ in columns]
-        d.search = "\x00".join(d.cells).lower()   # \x00: a token never matches across fields
+        d.lcells = [c.lower() for c in d.cells]
+        d.search = "\x00".join(d.lcells)          # \x00: a word never matches across two columns
         devices.append(d)
     return devices, columns, warns
 
@@ -333,54 +346,137 @@ def device_key(d):
     return d.name or d.host
 
 
-PING_NAMES = {PING_UP: "up", PING_DOWN: "down", PING_WAIT: "wait"}
-IS_FAVORITE = ("fav", "favs", "favorite", "favourite", "star")
-IS_RECENT = ("recent", "used", "history")
+BOUNDARY = " -_./:@"
 
 
-def search_term(token, fields, ping, favorites, recent):
-    """One search word -> test function.  See filter_devices for the syntax."""
+def fuzzy_match(pattern, text):
+    """fzf-like match of pattern (lower case) in text (lower case): the letters must
+    appear in this order.  Returns (score, positions) or None.  A plain substring
+    always beats a scattered match; word starts and adjacent letters score higher."""
+    i = text.find(pattern)
+    if i >= 0:
+        bonus = 30 if i == 0 or text[i - 1] in BOUNDARY else 0
+        return 1000 + 2 * len(pattern) + bonus, tuple(range(i, i + len(pattern)))
+    pi = 0                                       # forward: the earliest end of a match ...
+    for end, ch in enumerate(text):
+        if ch == pattern[pi]:
+            pi += 1
+            if pi == len(pattern):
+                break
+    else:
+        return None
+    pi = len(pattern) - 1                        # ... backward: the tightest start for it
+    for start in range(end, -1, -1):
+        if text[start] == pattern[pi]:
+            pi -= 1
+            if pi < 0:
+                break
+    positions, pi = [], 0
+    for ti in range(start, end + 1):
+        if pi < len(pattern) and text[ti] == pattern[pi]:
+            positions.append(ti)
+            pi += 1
+    score, prev = 0, None
+    for pos in positions:
+        score += 1
+        if pos == 0 or text[pos - 1] in BOUNDARY:
+            score += 8
+        if prev is not None:
+            score += 5 if pos == prev + 1 else -min(3, pos - prev - 1)
+        prev = pos
+    return score, tuple(positions)
+
+
+def fuzzy_term(word):
+    """Test for one fuzzy word: the best-matching visible column wins."""
+    def test(d):
+        best = None
+        for i, cell in enumerate(d.lcells):
+            m = fuzzy_match(word, cell)
+            if m and (best is None or m[0] > best[0]):
+                best = (m[0], i, m[1])
+        return best
+    return test
+
+
+def status_term(states, value):
+    """ping:/ssh: filters.  'none' = not checked yet, otherwise the start of a state."""
+    if value == "none":
+        return lambda d: d.host not in states
+    return lambda d: d.host in states and states[d.host].startswith(value)
+
+
+def exact_term(token, fields, status, favorites, recent):
+    """Every non-fuzzy term -> test function returning True / False."""
     name, sep, value = token.partition(":")
     if sep:
-        if name == "is" and value in IS_FAVORITE:
+        if token == "is:fav":
             return lambda d: device_key(d) in favorites
-        if name == "is" and value in IS_RECENT:
+        if token == "is:recent":
             return lambda d: device_key(d) in recent
-        if name == "ping":
-            return lambda d: PING_NAMES.get(ping.get(d.host), "none").startswith(value)
+        if name in ("ping", "ssh"):
+            return status_term(status.get(name, {}), value)
         header = fields.get(name)
         if header is not None:
             if not value:
                 return lambda d: not d.values.get(header)
             return lambda d: value in d.values.get(header, "").lower()
-    # plain word - also unknown "x:y" such as IPv6 addresses
+    # plain text - also unknown "x:y" such as IPv6 addresses
     return lambda d: token in d.search
 
 
-def filter_devices(devices, query, fields=None, ping=None, favorites=(), recent=None):
+def filter_devices(devices, query, fields=None, status=None, favorites=(), recent=None, found=None):
     """Space separated terms, all must match, case-insensitive:
-         word          part of a visible column
+         word          fuzzy: the letters in this order in a visible column (bc01 -> ber-core-01)
+         'word         exact: part of a visible column
          field:value   part of that CSV column (header or table label), field: = empty
-         ping:down     ping state: up, down, wait, none
+         ping:down     ping state: up, down, wait, none     ssh:closed  open, closed, no, wait, none
          is:fav        favourites         is:recent   switches you connected to
-         -term         excludes, e.g. -test  -type:edge  -ping:up"""
+         -term         excludes (exact), e.g. -test  -type:edge  -ping:up
+    If found is a dict, it receives device -> (score, {column: positions}) for fuzzy words."""
     tests = []
     for token in query.lower().split():
         negate = len(token) > 1 and token.startswith("-")
         if negate:
             token = token[1:]
-        tests.append((negate, search_term(token, fields or {}, ping or {}, favorites, recent or {})))
+        name, sep, _ = token.partition(":")
+        plain = not sep or (name not in ("is", "ping", "ssh") and name not in (fields or {}))
+        if plain and not negate and not token.startswith("'"):
+            tests.append((False, True, fuzzy_term(token)))
+        else:
+            if token.startswith("'") and len(token) > 1:
+                token = token[1:]
+            tests.append((negate, False, exact_term(token, fields or {}, status or {}, favorites, recent or {})))
     if not tests:
         return list(devices)
-    return [d for d in devices if all(test(d) != negate for negate, test in tests)]
+    out = []
+    for d in devices:
+        score, marks = 0, {}
+        for negate, fuzzy, test in tests:
+            result = test(d)
+            if fuzzy:
+                if result is None:
+                    break
+                score += result[0]
+                marks.setdefault(result[1], set()).update(result[2])
+            elif bool(result) == negate:
+                break
+        else:
+            out.append(d)
+            if found is not None and marks:
+                found[d] = (score, marks)
+    return out
 
 
-def default_order(view, query, favorites, recent):
-    """Order without a chosen sort column: newest first for is:recent,
-    otherwise favourites pinned on top (both keep the CSV order otherwise)."""
-    if any(t in ["is:" + v for v in IS_RECENT] for t in query.lower().split()):
+def default_order(view, query, favorites, recent, found=None):
+    """Order without a chosen sort column: newest first for is:recent; otherwise
+    favourites pinned on top, and with fuzzy words the best matches first."""
+    if "is:recent" in query.lower().split():
         return sorted(view, key=lambda d: recent.get(device_key(d), 0), reverse=True)
-    return [d for d in view if device_key(d) in favorites] + [d for d in view if device_key(d) not in favorites]
+    view = [d for d in view if device_key(d) in favorites] + [d for d in view if device_key(d) not in favorites]
+    if found:
+        view.sort(key=lambda d: -found.get(d, (0,))[0])    # stable: favourites win ties
+    return view
 
 
 class UserState(object):
@@ -464,9 +560,6 @@ def natural_key(text):
     return key
 
 
-PING_RANK = {PING_DOWN: 0, PING_UP: 1, PING_WAIT: 2}
-
-
 def next_sort(sort_col, sort_desc, col):
     """Pressing a column's sort key: ascending -> descending -> off (original order)."""
     if sort_col != col:
@@ -483,15 +576,17 @@ def cycle_sort(sort_col, ncols, step):
     return order[(position + step) % len(order)]
 
 
-def sort_devices(devices, col, desc, ping_states):
-    """col indexes the visible columns; col == len(cells) is the Ping column.
-    Empty values always go last."""
+def sort_devices(devices, col, desc, status=()):
+    """col indexes the visible columns, then the status columns (status = [ping, ssh]
+    state dicts; problems sort first).  Empty values always go last."""
     if col is None or not devices:
         return list(devices)
     if col >= len(devices[0].cells):
+        states = status[col - len(devices[0].cells)]
+
         def value(d):
-            return ping_states.get(d.host, "")
-        key = lambda d: PING_RANK.get(value(d), 9)
+            return states.get(d.host, "")
+        key = lambda d: STATUS_RANK.get(value(d), 9)
     else:
         def value(d):
             return d.cells[col]
@@ -543,48 +638,79 @@ def ping_once(host, timeout):
         return False
 
 
-class BatchPing(object):
-    """Pings many hosts with a bounded number of worker threads."""
+def ssh_check(host, port, timeout):
+    """Does an SSH server answer?  Connects and waits for its "SSH-" greeting -
+    no login, no password.  Returns SSH_OPEN, SSH_CLOSED or SSH_SILENT."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as conn:
+            try:
+                greeting = conn.recv(64)
+            except socket.timeout:              # some servers wait for the client to speak first
+                conn.sendall(b"SSH-2.0-TRee-Li_check\r\n")
+                greeting = conn.recv(64)
+        return SSH_OPEN if greeting.startswith(b"SSH-") else SSH_SILENT
+    except ConnectionRefusedError:
+        return SSH_CLOSED
+    except (OSError, ValueError):               # timeout, unreachable, unknown name
+        return SSH_SILENT
 
-    def __init__(self, hosts, workers, timeout, states):
-        self.hosts, self.states, self.timeout = hosts, states, timeout
-        self.total, self.done, self.up, self.down = len(hosts), 0, 0, 0
+
+class BatchCheck(object):
+    """Pings and SSH-checks many hosts with a bounded number of worker threads."""
+
+    def __init__(self, hosts, cfg, ping_states, ssh_states):
+        self.cfg = cfg
+        self.states = {"ping": ping_states, "ssh": ssh_states}
+        self.tasks = [(h, kind) for h in hosts for kind in ("ping", "ssh")]
+        self.hosts = len(hosts)
+        self.done = 0
+        self.counts = {}
         self.cancelled = self.reported = False
         self._next = 0
         self._lock = threading.Lock()
         for h in hosts:
-            states[h] = PING_WAIT
-        self.threads = [threading.Thread(target=self._work) for _ in range(min(workers, self.total))]
+            ping_states[h] = ssh_states[h] = WAIT
+        self.threads = [threading.Thread(target=self._work) for _ in range(min(cfg.ping_workers, len(self.tasks)))]
         for t in self.threads:
             t.daemon = True
             t.start()
 
     def _work(self):
+        cfg = self.cfg
         while True:
             with self._lock:
-                if self.cancelled or self._next >= self.total:
+                if self.cancelled or self._next >= len(self.tasks):
                     return
-                host = self.hosts[self._next]
+                host, kind = self.tasks[self._next]
                 self._next += 1
-            ok = ping_once(host, self.timeout)
+            if kind == "ping":
+                result = PING_UP if ping_once(host, cfg.ping_timeout) else PING_DOWN
+            else:
+                result = ssh_check(host, cfg.ssh_port, cfg.ssh_check_timeout)
             with self._lock:
-                self.states[host] = PING_UP if ok else PING_DOWN
+                self.states[kind][host] = result
+                self.counts[result] = self.counts.get(result, 0) + 1
                 self.done += 1
-                if ok:
-                    self.up += 1
-                else:
-                    self.down += 1
 
     @property
     def running(self):
         return any(t.is_alive() for t in self.threads)
 
+    @property
+    def percent(self):
+        return 100 * self.done // max(1, len(self.tasks))
+
+    def summary(self):
+        c = self.counts
+        return "ping %d up, %d down / ssh %d open, %d closed, %d no answer" % (
+            c.get(PING_UP, 0), c.get(PING_DOWN, 0), c.get(SSH_OPEN, 0), c.get(SSH_CLOSED, 0), c.get(SSH_SILENT, 0))
+
     def cancel(self):
         with self._lock:
             self.cancelled = True
-            for h in self.hosts[self._next:]:
-                if self.states.get(h) == PING_WAIT:
-                    del self.states[h]
+            for host, kind in self.tasks[self._next:]:
+                if self.states[kind].get(host) == WAIT:
+                    del self.states[kind][host]
 
 
 class ProcStream(object):
@@ -992,8 +1118,11 @@ def read_key(win, timeout_ms):
                 if isinstance(c, int) or (not seq and c not in "[O"):
                     # not an escape sequence: a plain ESC, then another key - keep that key
                     try:
-                        curses.unget_wch(c)
-                    except (curses.error, OverflowError):
+                        if isinstance(c, int):
+                            curses.ungetch(c)            # a key code such as KEY_UP
+                        else:
+                            curses.unget_wch(c)
+                    except (curses.error, OverflowError, ValueError):
                         pass
                     break
                 seq += c
@@ -1050,18 +1179,6 @@ def fit_widths(widths, available, minimum=6):
         i = widths.index(max(widths))
         widths[i] -= 1
     return widths
-
-
-def wrap_words(text, width, indent=0):
-    """Wrap at spaces; continuation lines are indented."""
-    lines, line = [], ""
-    for word in text.split(" "):
-        if line and len(line) + 1 + len(word) > width:
-            lines.append(line)
-            line = " " * indent + word
-        else:
-            line = (line + " " + word) if line else word
-    return lines + [line]
 
 
 def wrap_lines(lines, width):
@@ -1127,6 +1244,8 @@ PALETTE = {
     "wait_sel":    ((223, 25, ""),  ("yellow", "blue", "")),
     "fav":         ((214, -1, "b"), ("yellow", -1, "b")),
     "fav_sel":     ((214, 25, "b"), ("yellow", "blue", "b")),
+    "match":       ((111, -1, "bu"), ("cyan", -1, "bu")),
+    "match_sel":   ((189, 25, "bu"), ("white", "blue", "bu")),
     "key":         ((111, -1, "b"), ("cyan", -1, "b")),
     "hint":        ((67, -1, ""),   ("blue", -1, "b")),
     "msg":         ((189, -1, ""),  ("cyan", -1, "")),
@@ -1150,7 +1269,7 @@ PALETTE = {
     "banner5":     ((189, -1, "b"), ("cyan", -1, "b")),
 }
 # Without colours: attributes only.
-MONO = {"fav": "b", "fav_sel": "r", "brand": "b", "info": "d", "tab_active": "r", "prompt": "b", "cursor": "r",
+MONO = {"match": "bu", "match_sel": "rbu", "fav": "b", "fav_sel": "r", "brand": "b", "info": "d", "tab_active": "r", "prompt": "b", "cursor": "r",
         "placeholder": "d", "head": "b", "sort": "b", "sel": "r", "marker": "b", "up": "b", "down": "b",
         "up_sel": "r", "down_sel": "r", "wait_sel": "r", "key": "b", "hint": "d", "err": "b", "field": "r",
         "backdrop": "d", "win_title": "b", "win_label": "b", "win_key": "b", "win_err": "b", "field_idle": "u",
@@ -1220,7 +1339,9 @@ class App(object):
         self.body_h = 1
         self.query = ""
         self.sort_col, self.sort_desc = None, False
-        self.ping = {}                 # host -> PING_UP / PING_DOWN / PING_WAIT
+        self.ping = {}                 # host -> PING_UP / PING_DOWN / WAIT
+        self.ssh = {}                  # host -> SSH_OPEN / SSH_CLOSED / SSH_SILENT / WAIT
+        self.found = {}                # device -> (score, {column: positions}) of fuzzy words
         self.batch = None
         self.creds = None              # (user, password or None) - memory only
         self.state = UserState(cfg.state_dir)
@@ -1250,7 +1371,10 @@ class App(object):
         return self.view[self.cursor] if 0 <= self.cursor < len(self.view) else None
 
     def ncols(self):
-        return len(self.columns) + 1          # + Ping
+        return len(self.columns) + len(STATUS_LABELS)
+
+    def status(self):
+        return [self.ping, self.ssh]
 
     def load(self):
         keep = self.selected()
@@ -1272,21 +1396,23 @@ class App(object):
                 self.message("; ".join(warns), error=True, seconds=15)
         self.widths = [min(40, max([len(label) + 2] + [len(d.cells[i]) for d in self.devices]))
                        for i, (_, label) in enumerate(self.columns)]
-        self.widths.append(len(PING_LABEL) + 2)          # "PING ^" and "* down" both fit
+        self.widths += STATUS_WIDTHS
         if keep is not None:
             keep = next((d for d in self.devices if d.host == keep.host and d.name == keep.name), None)
         self.apply_sort(keep)
 
     def apply_sort(self, keep=None):
-        self.devices = sort_devices(self.loaded, self.sort_col, self.sort_desc, self.ping)
+        self.devices = sort_devices(self.loaded, self.sort_col, self.sort_desc, self.status())
         self.refilter(keep)
 
     def refilter(self, keep=None):
         keep = keep or self.selected()
         state = self.state
-        view = filter_devices(self.devices, self.query, self.fields, self.ping, state.favorites, state.recent)
+        self.found = {}
+        view = filter_devices(self.devices, self.query, self.fields, {"ping": self.ping, "ssh": self.ssh},
+                              state.favorites, state.recent, self.found)
         if self.sort_col is None:
-            view = default_order(view, self.query, state.favorites, state.recent)
+            view = default_order(view, self.query, state.favorites, state.recent, self.found)
         self.view = view
         self.cursor = 0
         for i, d in enumerate(self.view):
@@ -1305,6 +1431,13 @@ class App(object):
         self.apply_sort()
         if self.sort_col is None:
             self.message("Original order")
+
+    def status_changed(self, keep=None):
+        """New ping / SSH results: keep a status sort and ping: / ssh: searches up to date."""
+        if self.sort_col is not None and self.sort_col >= len(self.columns):
+            self.apply_sort(keep)
+        elif "ping:" in self.query.lower() or "ssh:" in self.query.lower():
+            self.refilter(keep)
 
     def sync_size(self):
         size = terminal_size()
@@ -1325,7 +1458,7 @@ class App(object):
     #    ────────────────────────────────────────────────────────────────        rule
     #  ▌* ber-core-01  192.0.2.1    ...                              ● up        rows
     # ───────────────────────────────────────────────────────────────────────  rule
-    #  Enter run  ←→ command  type search  F1-F6 sort  ^R reload  ^C quit        footer
+    #  Enter run  ←→ command  ^F favourite  F1-F6 sort  ^R reload  ^C quit       footer
 
     TABLE_X = 4          # column 1: selection marker, column 2: favourite star
 
@@ -1384,8 +1517,10 @@ class App(object):
         if self.creds:
             right = "%s %s %s" % (self.creds[0], sym["sep"], right)
         batch = ""
-        if self.batch and self.batch.running:
-            batch = "batch ping %d/%d %s ESC cancels" % (self.batch.done, self.batch.total, sym["sep"])
+        if self.batch and self.batch.running and not self.batch.cancelled:
+            batch = "batch ping %d%%" % self.batch.percent
+            if not self.query:
+                batch += " %s ESC cancels" % sym["sep"]
         hints = [("Enter", "run"), (sym["lr"], "command"), ("^F", "favourite"),
                  ("F1-F%d" % self.ncols(), "sort"), ("^R", "reload"), ("^C", "quit")]
         self.draw_frame("Switch Manager", right, hints=hints, footer_right=batch, footer_attr=th.wait)
@@ -1406,25 +1541,26 @@ class App(object):
         shown = self.query[-(w - 9):]
         x = 5
         for part in re.split(r"(\s+)", shown):
-            neg = part[:1] if len(part) > 1 and part.startswith("-") else ""
+            neg = part[:1] if len(part) > 1 and part[0] in "-'" else ""
             name, sep, value = part[len(neg):].partition(":")
-            if sep and (name.lower() in self.fields or name.lower() in ("is", "ping")):
-                pieces = [(neg, th.err), (name + sep, th.key), (value, th.text)]
+            neg_attr = th.err if neg == "-" else th.key
+            if sep and (name.lower() in self.fields or name.lower() in ("is", "ping", "ssh")):
+                pieces = [(neg, neg_attr), (name + sep, th.key), (value, th.text)]
             else:
-                pieces = [(neg, th.err), (part[len(neg):], th.text)]
+                pieces = [(neg, neg_attr), (part[len(neg):], th.text)]
             for text, attr in pieces:
                 put(scr, y_search, x, text, attr)
                 x += len(text)
         put(scr, y_search, x, " ", th.cursor)
         if not self.query:
-            put(scr, y_search, 7, "type to search %s type:core  -test  ping:down  is:fav  is:recent" % sym["sep"],
+            put(scr, y_search, 7, "type to search (fuzzy) %s 'exact  type:core  -test  ssh:closed  is:fav" % sym["sep"],
                 th.placeholder)
 
         # table head
         x0 = self.TABLE_X
         widths = fit_widths(self.widths, w - x0 - 3 - 2 * (len(self.widths) - 1))
         table_w = sum(widths) + 2 * (len(widths) - 1)
-        labels = [label for _, label in self.columns] + [PING_LABEL]
+        labels = [label for _, label in self.columns] + STATUS_LABELS
         x = x0
         for i, label in enumerate(labels):
             label = label.upper()
@@ -1454,7 +1590,6 @@ class App(object):
                 text, attr = "The switch list is empty", th.placeholder
             put(scr, y_body + 1, x0, text, attr)
 
-        names = {PING_UP: "up", PING_DOWN: "down", PING_WAIT: "wait"}
         for row in range(body_h):
             idx = self.top + row
             if idx >= len(self.view):
@@ -1468,14 +1603,22 @@ class App(object):
             if device_key(d) in self.state.favorites:
                 put(scr, y, 2, "*", th.fav_sel if sel else th.fav)
             x = x0
+            marks = self.found.get(d, (0, {}))[1]
             for i, value in enumerate(d.cells):
-                put(scr, y, x, fit(value, widths[i], sym["more"]), th.sel if sel else th.text)
+                shown = fit(value, widths[i], sym["more"])
+                put(scr, y, x, shown, th.sel if sel else th.text)
+                visible = len(value) if len(value) <= widths[i] else widths[i] - 1
+                for pos in marks.get(i, ()):           # letters that matched the search
+                    if pos < visible:
+                        put(scr, y, x + pos, value[pos], th.match_sel if sel else th.match)
                 x += widths[i] + 2
-            state = self.ping.get(d.host, "")
-            if state:
-                style = {PING_UP: "up", PING_DOWN: "down"}.get(state, "wait") + ("_sel" if sel else "")
-                put(scr, y, x, fit("%s %s" % (sym["dot"], names.get(state, state)), widths[-1]),
-                    getattr(th, style))
+            for k, states in enumerate(self.status()):
+                state = states.get(d.host)
+                if state:
+                    style = STATUS_STYLE.get(state, "wait") + ("_sel" if sel else "")
+                    put(scr, y, x, fit("%s %s" % (sym["dot"], state), widths[len(d.cells) + k]),
+                        getattr(th, style))
+                x += widths[len(d.cells) + k] + 2
 
         # scrollbar when the list is longer than the screen
         if len(self.view) > body_h:
@@ -1495,10 +1638,8 @@ class App(object):
             if self.batch and not self.batch.running and not self.batch.reported:
                 self.batch.reported = True
                 if not self.batch.cancelled:
-                    self.message("Batch ping finished: %d UP, %d DOWN  (F%d sorts by Ping)"
-                                 % (self.batch.up, self.batch.down, self.ncols()), seconds=15)
-                if self.sort_col == self.ncols() - 1:
-                    self.apply_sort()
+                    self.message("Batch ping done: %s" % self.batch.summary(), seconds=20)
+                self.status_changed()
             self.draw()
             key = read_key(self.scr, 250)
             if key is None:
@@ -1545,14 +1686,14 @@ class App(object):
             words = self.query.split()
             self.query = " ".join(words[:-1]) + (" " if len(words) > 1 else "")
             self.refilter()
-        elif key == "ESC":
-            if self.batch and self.batch.running:
-                self.batch.cancel()
-                self.message("Batch ping cancelled")
-            elif self.query:
+        elif key == "ESC":                   # one step at a time: search, batch ping, sort
+            if self.query:
                 self.query = ""
                 self.refilter()
-            elif self.sort_col is not None:  # second ESC: back to the original order
+            elif self.batch and self.batch.running:
+                self.batch.cancel()
+                self.message("Batch ping cancelled")
+            elif self.sort_col is not None:
                 self.set_sort(None, desc=False)
         elif key == "CTRL_F":
             dev = self.selected()
@@ -1596,8 +1737,11 @@ class App(object):
         elif command == "ping":
             stream = ProcStream(ping_argv(dev.host, 4, max(2, self.cfg.ping_timeout)))
             self.show_text("ping %s (%s)" % (dev.name, dev.host), stream=stream)
-            if stream.done and stream.returncode is not None:
-                self.ping[dev.host] = PING_UP if stream.returncode == 0 else PING_DOWN
+            if any(" bytes from " in line for line in stream.snapshot()):
+                self.ping[dev.host] = PING_UP          # also when closed before ping finished
+            elif stream.done:
+                self.ping[dev.host] = PING_DOWN
+            self.status_changed(dev)
         elif command == "traceroute":
             argv = trace_argv(self.cfg, dev.host)
             if argv is None:
@@ -1611,7 +1755,7 @@ class App(object):
 
     def start_batch(self):
         if self.batch and self.batch.running:
-            self.message("Batch ping is already running (ESC cancels)")
+            self.message("Batch ping is already running (ESC with an empty search cancels it)")
             return
         if not which("ping"):
             self.message("'ping' is not installed", error=True)
@@ -1624,8 +1768,8 @@ class App(object):
         if not hosts:
             self.message("No switches to ping", error=True)
             return
-        self.batch = BatchPing(hosts, self.cfg.ping_workers, self.cfg.ping_timeout, self.ping)
-        self.message("Batch ping started for %d switches" % len(hosts))
+        self.batch = BatchCheck(hosts, self.cfg, self.ping, self.ssh)
+        self.message("Batch ping started for %d switches (ping + SSH port %d)" % (len(hosts), self.cfg.ssh_port))
 
     # -- popups -------------------------------------------------------------
 
@@ -1700,8 +1844,9 @@ class App(object):
         th = self.th
         last = self.state.recent.get(device_key(dev))
         values = list(dev.values.items()) + [
-            (PING_LABEL, PING_NAMES.get(self.ping.get(dev.host), "not checked")),
-            ("Favourite", "yes" if device_key(dev) in self.state.favorites else "no  (Ctrl-F)"),
+            ("Ping", self.ping.get(dev.host, "not checked")),
+            ("SSH port %d" % self.cfg.ssh_port, self.ssh.get(dev.host, "not checked")),
+            ("Favourite", "yes" if device_key(dev) in self.state.favorites else "no"),
             ("Last connected", time.strftime("%Y-%m-%d %H:%M", time.localtime(last)) if last else "never"),
         ]
         width = max(len(k) for k, _ in values)
@@ -1726,18 +1871,20 @@ class App(object):
         item("Left Right", "select a command")
         item("Enter", "run the selected command")
         item("just type", "search - several words must all match")
-        item("Backspace  Ctrl-U  ESC", "edit / clear the search (ESC again: clear the sort)")
+        item("Backspace  Ctrl-W  Ctrl-U", "delete a character / word / the whole search")
+        item("ESC", "clear the search, then: cancel batch ping, then: clear the sort")
         item("Ctrl-F", "mark / unmark the switch as favourite (*)")
         item("F1..F%d" % self.ncols(), "sort by column: press again for reverse, a third time for off")
         item("Tab  Shift-Tab", "next / previous sort column, then off")
         item("Ctrl-R", "reload the switch list")
         item("Ctrl-C", "quit")
         section("Search")
-        item("ber core", "all words must match (visible columns)")
+        item("bc01  ber core", "fuzzy: letters in this order, best matches first")
+        item("'10.1.2", "exact: this text exactly")
         item("type:core  responsible:timmy", "a CSV column, also ones not shown in the table")
         item("location:", "column is empty")
-        item("-test  -type:edge", "exclude")
-        item("ping:down", "ping state: up, down, wait, none")
+        item("-test  -type:edge", "exclude (exact)")
+        item("ping:down  ssh:closed", "state: up/down, open/closed/no answer, wait, none")
         item("is:fav", "your favourites (always listed first)")
         item("is:recent", "switches you connected to, newest first")
         section("Commands")
@@ -1745,7 +1892,7 @@ class App(object):
         item("", "in memory only. Log out of the switch to come back.")
         item("ping", "ping the selected switch")
         item("traceroute", "trace the path (traceroute, or tracepath)")
-        item("batch ping", "ping every switch in the current list -> Ping column")
+        item("batch ping", "ping + SSH check of the current list -> Ping / SSH")
         item("details", "all fields of the selected switch")
         item("help", "this screen")
         item("exit", "quit TRee-Li and forget the credentials")
@@ -1805,7 +1952,7 @@ class App(object):
                 if active:
                     put(scr, y, x0 + 15 + len(shown), " ", th.cursor)
             if error:
-                for i, line in enumerate(wrap_words(sym["dot"] + " " + error, bw - 6, indent=2)[:2]):
+                for i, line in enumerate(textwrap.wrap(sym["dot"] + " " + error, bw - 6, subsequent_indent="  ")[:2]):
                     put(scr, y0 + 6 + i, x0 + 3, line, th.win_err)
             put(scr, y0 + 8, x0 + 3, ("Kept in memory only %s forgotten when TRee-Li exits" % sym["sep"])[:bw - 6],
                 th.win_hint)
@@ -1872,6 +2019,7 @@ class App(object):
                 self.message("%s: host key changed - not connected" % dev.name, error=True, seconds=15)
             elif not result.failed:
                 self.state.touch(device_key(dev))
+                self.refilter(dev)             # is:recent / recent order are up to date at once
                 self.message("Disconnected from %s" % dev.name)
             else:
                 text = "%s: ssh exit code %d" % (dev.name, result.exit_code)

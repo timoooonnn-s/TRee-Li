@@ -21,6 +21,9 @@
 - [x] Favourites (Ctrl-F, pinned, `is:fav`) and history (`is:recent`, "Last connected" in details)
 - [x] 46 tests
 
+## Milestone 1d: transport without GitHub. DONE (2026-10-02)
+- [x] `tools/make-bundle.py` -> one self-extracting text file (checksum, safe paths, keeps data.csv / tree-li.conf, survives CRLF)
+
 ## Milestone 2: field test (needs the user)
 - [ ] Run `./tree-li --check` on the RHEL server
 - [ ] ssh into a real Extreme Fabric Engine switch: password prompt detected? logout returns to the menu?

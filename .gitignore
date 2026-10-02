@@ -5,3 +5,4 @@ tree-li.conf
 __pycache__/
 *.pyc
 .DS_Store
+dist/

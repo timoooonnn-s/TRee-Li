@@ -21,8 +21,8 @@ The code side lives in `PALETTE` in `tree-li`. This page is the reference for bo
 | Name | Terminal | Used for |
 |---|---|---|
 | **Highlight Orange** | 214 `#ffaf00` | favourite star `*` |
-| Up | 78 `#5fd787` | `● up` |
-| Down | 203 `#ff5f5f` | `● down`, errors |
+| Up | 78 `#5fd787` | `● up`, `● open` |
+| Down | 203 `#ff5f5f` | `● down`, `● closed`, `● no answer`, errors |
 | Wait | 179 `#d7af5f` | `● wait`, "running" |
 
 ## Rules
@@ -30,6 +30,7 @@ The code side lives in `PALETTE` in `tree-li`. This page is the reference for bo
 - **Light on dark, strong as background.** Sky and Mist carry text; TRee Blue and Steel are surfaces.
   Body text uses the terminal's own foreground, so light terminal themes still work.
 - **Highlights stay small:** one character or one word (a star, a dot, a status). Never colour whole rows with them.
+- **Search matches:** the matched letters are Sky, bold and underlined (Mist on the selection bar).
 - **Layout:** top bar → divider line → tabs → search → table → divider line → footer with key hints.
   Two columns of margin on the left; blocks are separated by space and thin lines, not boxes.
 - **Dialogs:** the screen behind fades to Fade grey. The window is a Steel panel with a thin

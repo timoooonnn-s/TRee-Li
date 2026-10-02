@@ -8,17 +8,91 @@
   |_|  |_| \_\ \___| \___|       |_____||_|
 ```
 
-A switch manager for the terminal: search your switch list, ssh into a switch,
-log out, and you're back in the list. It runs on any Linux server you
-reach over SSH (PuTTY, Tabby, ...). No GUI and no X11.
-
-Inspired by [V-Li: Switch Manager](https://github.com/seismicindustries/switch-manager).
-TRee-Li keeps its menu and keys, but runs ssh *inside* your terminal instead of
-opening a new desktop window.
+Search your switch list, ssh into a switch, log out, and you're back in the list,
+all inside the terminal of a Linux server you reach over SSH (PuTTY, Tabby, ...).
 
 - **One file, Python 3 standard library only.** No pip, no venv, no root.
-- **Credentials asked once per session.** They stay in memory only and are forgotten when TRee-Li exits.
+- **Password asked once per session.** It stays in memory only and is forgotten when TRee-Li exits.
 - **After you log out of a switch, you're back in TRee-Li.**
+
+Inspired by [V-Li: Switch Manager](https://github.com/seismicindustries/switch-manager).
+TRee-Li keeps its menu, but runs ssh inside your terminal instead of a new desktop window.
+
+**[Quick start](#quick-start)**: up and running in five minutes.
+**[Reference](#reference)**: everything in detail.
+
+---
+
+# Quick start
+
+### 1. Check the requirements
+
+On the server: Linux, **Python 3.8 or newer** (`python3 --version`), the OpenSSH client and `ping`.
+`traceroute` or `tracepath` is optional.
+
+### 2. Get TRee-Li
+
+```bash
+git clone <repo-url> ~/tree-li
+```
+
+Any directory works, for example a [shared team folder](#team-setup).
+No git on the server? Use the [single-file bundle](#single-file-bundle) instead.
+
+### 3. Add your switches
+
+```bash
+cd ~/tree-li
+cp data.example.csv data.csv
+```
+
+Then put your switches into `data.csv`: one line per switch, at least `Name` and `IP`
+([format](#switch-list-datacsv)). Check it with:
+
+```bash
+./tree-li --check
+```
+
+### 4. Start it
+
+```bash
+./tree-li
+```
+
+To start it from anywhere with just `tree-li`, add an alias:
+
+```bash
+echo "alias tree-li='$HOME/tree-li/tree-li'" >> ~/.bashrc
+```
+
+### 5. Use it
+
+1. **Type** to filter the list. A few letters are enough: `bc01` finds `ber-core-01`.
+2. Pick a switch with **↑ ↓**. **ssh** is already selected, so press **Enter**.
+3. Enter your username and password **once**. TRee-Li logs you in, now and for every following switch.
+4. **Log out** of the switch, and you're back in the list.
+5. **← →** selects the other commands (ping, batch ping, details, help, exit).
+
+All keys: [Keys](#keys) or the **help** command inside TRee-Li. If something looks wrong, see [Troubleshooting](#troubleshooting).
+
+---
+
+# Reference
+
+- [Screen](#screen)
+- [Keys](#keys)
+- [Commands](#commands)
+- [Search](#search)
+- [Favourites and recent switches](#favourites-and-recent-switches)
+- [Switch list (`data.csv`)](#switch-list-datacsv)
+- [Configuration](#configuration)
+- [Team setup](#team-setup)
+- [Single-file bundle](#single-file-bundle)
+- [Session logging](#session-logging)
+- [Colours and symbols](#colours-and-symbols)
+- [Security](#security)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
 
 ## Screen
 
@@ -30,170 +104,187 @@ opening a new desktop window.
 
   ›  ber core
 
-   NAME          IP            SUBNET    ALIAS                COMMENT    PING ▲
-   ─────────────────────────────────────────────────────────────────────────────
- ▌ ber-core-01   192.0.2.1     ber       Core switch Berlin   5520       ● down
-   ber-core-02   192.0.2.7     ber       Core switch Berlin   VSP7400    ● up
+    NAME          IP            SUBNET    ALIAS                COMMENT    PING ▲  SSH
+    ─────────────────────────────────────────────────────────────────────────────────────────
+ ▌* ber-core-01   192.0.2.1     ber       Core switch Berlin   5520       ● down  ● no answer
+    ber-core-02   192.0.2.7     ber       Core switch Berlin   VSP7400    ● up    ● open
 
 ───────────────────────────────────────────────────────────────────────────────────
-  Enter run  ←→ command  type search  F1-F6 sort  ^R reload  ^C quit
+  Enter run  ←→ command  ^F favourite  F1-F6 sort  ^R reload  ^C quit
 ```
 
-Colours are shades of blue. They adapt to the terminal: 256 colours in Tabby or with
-`TERM=xterm-256color`, 8 colours in PuTTY's default `TERM=xterm`, and plain bold/reverse without colour.
-Lines and symbols use Unicode on UTF-8 terminals. If they look garbled (an old PuTTY
-font or a non-UTF-8 character set), start with `--ascii` or set `charset = ascii`.
+From top to bottom:
+- **Top bar:** your login user once you've connected, and how many switches are shown.
+- **Command tabs.**
+- **Search line.**
+- **Table:**
+  - `▌` marks the selected row.
+  - `*` marks a [favourite](#favourites-and-recent-switches).
+  - `▲`/`▼` shows the sorted column.
+  - **PING** and **SSH** show the results of the last [batch ping](#commands).
+  - Letters matching the [search](#search) are underlined.
+- **Footer:** key hints, or a message for a few seconds.
 
 ## Keys
 
 | Key | Action |
 |---|---|
-| `Up` `Down` `PgUp` `PgDn` `Home` `End` | select a switch |
-| `Left` `Right` | select a command |
+| `↑` `↓` `PgUp` `PgDn` `Home` `End` | select a switch |
+| `←` `→` | select a command |
 | `Enter` | run the selected command on the selected switch |
-| just type | search. All words must match (`ber core` finds Berlin core switches); see [Search](#search) |
-| `Backspace`, `Ctrl-U`, `ESC` | edit / clear the search. `ESC` again (search empty) clears the sort. `ESC` also cancels a running batch ping |
-| `F1`...`F6` | sort by column: press once for ▲ ascending, again for ▼ descending, a third time for the original order |
+| just type | [search](#search) |
+| `Backspace` / `Ctrl-W` / `Ctrl-U` | delete a character / a word / the whole search |
+| `ESC` | step by step: 1. clears the search, 2. cancels a running batch ping, 3. clears the sort |
+| `F1` … `F7` | sort by that column: ▲ ascending → ▼ descending → original order |
 | `Tab` / `Shift-Tab` | next / previous sort column, after the last one: original order |
-| `Ctrl-F` | mark / unmark the selected switch as a favourite (`*`) |
+| `Ctrl-F` | mark / unmark the selected switch as a [favourite](#favourites-and-recent-switches) |
 | `Ctrl-R` | reload the switch list |
+| `Ctrl-L` | redraw the screen |
 | `Ctrl-C` | quit |
 
-In output windows (ping, traceroute, details, help): arrow keys and `PgUp`/`PgDn` scroll, and `ESC` / `Enter` / `q` closes.
-
-## Search
-
-| You type | Shows |
-|---|---|
-| `ber core` | switches where every word appears in a visible column |
-| `type:core` | the CSV column `type` contains "core". Works for **every** CSV column, also ones not shown in the table, and for table labels (`alias:munich`) |
-| `location:` | the column is empty |
-| `-test`, `-type:edge` | excludes matches |
-| `ping:down` | ping state `up`, `down`, `wait` or `none` (not pinged yet) |
-| `is:fav` | your favourites |
-| `is:recent` | switches you connected to, most recent first |
-
-Terms can be combined: `type:core -ber ping:down` shows core switches outside Berlin that didn't answer.
-
-## Favourites and recent switches
-
-- `Ctrl-F` marks the selected switch as a favourite. Favourites get an orange `*` and are listed **first**
-  (as long as no sort column is chosen with F1-F6).
-- Every successful ssh login is remembered. `is:recent` lists those switches, newest first, and
-  **details** shows "Last connected".
-- Both are **per user** in `~/.local/state/tree-li/` (`favorites`, `recent`, mode 0600), never in the shared directory
-  or the CSV. Colleagues each have their own.
+In full-screen output (ping, traceroute, details, help): `↑` `↓` `PgUp` `PgDn` scroll, and `ESC` / `Enter` / `q` closes.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| **ssh** | Connects to the switch. The first time, TRee-Li asks for your username (pre-filled with your Linux user) and password, and types the password for you from then on. Log out of the switch to come back. Use `~.` to force-close a hanging session. |
-| **ping** | `ping -c 4`, with live output. Also updates the Ping column. |
-| **traceroute** | Uses `traceroute`, or `tracepath` when traceroute isn't installed. |
-| **batch ping** | Pings every switch in the **current (filtered) list** in parallel and fills the Ping column with UP/DOWN. Press `F6` to sort by Ping. |
-| **details** | Shows every CSV field of the switch, including columns not in the table. |
-| **help** | Shows keys, the current file paths and settings. |
-| **exit** | Quits and forgets the credentials. |
+| **ssh** | Connects to the selected switch. The first time, TRee-Li asks for username and password (see [Security](#security)). Log out to come back; `~.` at the start of a line force-closes a hanging session. |
+| **ping** | `ping -c 4` with live output; also updates the Ping column. |
+| **traceroute** | `traceroute`, or `tracepath` if traceroute isn't installed. |
+| **batch ping** | Checks every switch in the **current, filtered** list in parallel. **PING:** `up` / `down`. **SSH:** `open` (an SSH server answers), `closed` (port refused) or `no answer`. The SSH check only waits for the server's greeting: no login, no password. Sorting by PING or SSH puts problems first. |
+| **details** | All CSV fields of the switch, plus ping state, favourite and last connection. |
+| **help** | Keys, search syntax, and the file paths in use. |
+| **exit** | Quits and forgets the password. |
 
-## Install
+## Search
 
-Requirements: Linux, Python ≥ 3.8 (`python3 --version`), OpenSSH client, `ping`.
-`traceroute` or `tracepath` is optional.
+All terms must match, case doesn't matter. Plain words are **fuzzy**, like fzf: the letters only have to appear
+in this order within one visible column. The best matches come first, and the matched letters are underlined.
 
-```bash
-git clone <repo-url> ~/tree-li        # or any directory, e.g. a shared team folder
-cd ~/tree-li
-cp data.example.csv data.csv          # then put your switches in data.csv
-./tree-li --check                     # validates config + switch list
-./tree-li
-```
+| You type | Shows |
+|---|---|
+| `bc01`, `ber core` | fuzzy: `bc01` finds `ber-core-01`; exact hits rank above scattered ones |
+| `'10.1.2` | exactly this text (a leading `'` switches fuzzy off for this word) |
+| `type:core` | the CSV column `type` contains "core". Works for **every** column, even ones not in the table, and for table labels (`alias:munich`) |
+| `location:` | the column is empty |
+| `-test`, `-type:edge` | excludes matches (always exact) |
+| `ping:down` | ping state: `up`, `down`, `wait`, or `none` (not checked yet) |
+| `ssh:closed`, `ssh:no` | SSH state: `open`, `closed`, `no` (no answer), `wait`, or `none` |
+| `is:fav` | your favourites |
+| `is:recent` | switches you connected to, newest first |
 
-To start it from anywhere, add an alias (the script finds its files even through a symlink):
+Example: `type:core -ber ping:up ssh:no` shows core switches outside Berlin that answer ping but not SSH.
 
-```bash
-echo "alias tree-li='$HOME/tree-li/tree-li'" >> ~/.bashrc
-```
+## Favourites and recent switches
 
-**Shared by a team** (no system-wide install needed): put the directory where
-your colleagues can read it, e.g. `/srv/netops/tree-li`, with one `data.csv`
-and an optional `tree-li.conf`. Everyone starts the same `tree-li`.
-Credentials and session logs stay per user.
-
-> If you copied the files through Windows and get `python3\r: No such file or directory`
-> or `Permission denied`, run `python3 tree-li` or fix the file with `sed -i 's/\r$//' tree-li; chmod +x tree-li`.
+- `Ctrl-F` marks a switch as a favourite (`*`). Favourites are listed first, as long as no column is sorted.
+- Every successful login is remembered. Find those switches with `is:recent`, or see "Last connected" in **details**.
+- Both are stored **per user** in `~/.local/state/tree-li/` (only readable by you), never in the shared folder or the CSV.
 
 ## Switch list (`data.csv`)
-
-The format is the same as V-Li: `;`-separated, first line is the header.
 
 ```csv
 Name;IP;subnet;aliases;comment;type;id;responsible;aix_server
 ber-core-01;192.0.2.1;ber;Core switch Berlin;5520;core;101;Ruffy;-
 ```
 
-- `Name` and `IP` are what TRee-Li really needs. Header names are case-insensitive.
-- The delimiter (`;` `,` `|` tab) is detected automatically. UTF-8 (with or without BOM) and Excel/Windows encoding both work.
+- The first line is the header. Only `Name` and `IP` are required, and header names are case-insensitive.
+- The delimiter (`;` `,` `|` tab) is detected automatically. UTF-8 and Excel/Windows files both work.
 - Empty lines and lines starting with `#` are ignored.
-- **Adding columns** (e.g. `location`): add them to the CSV. They appear in **details** right away.
-  To show and search them in the table, list them in `columns` in `tree-li.conf`, e.g.
-  `columns = Name, IP, location:Where, aliases:Alias, comment`
-- `data.csv` and `tree-li.conf` are in `.gitignore`, so your switch inventory never ends up on GitHub.
+- **New columns** (e.g. `location`) show up in **details** and `field:` [search](#search) right away.
+  To show one in the table, add it to `columns` in the [configuration](#configuration).
+- `data.csv` is in `.gitignore`, so your inventory never ends up in git.
 
 ## Configuration
 
-Everything is optional. See [`tree-li.conf.example`](tree-li.conf.example) for all options. Files are read in this order (later ones win):
+Everything is optional. All options with explanations are in [`tree-li.conf.example`](tree-li.conf.example).
+TRee-Li reads these files in order, and later ones win:
 
-1. `tree-li.conf` next to the `tree-li` script: team defaults
+1. `tree-li.conf` next to the `tree-li` script: team defaults (git-ignored)
 2. `~/.config/tree-li/tree-li.conf`: your personal settings
-3. `--config FILE`
+3. the file given with `--config FILE`
 
-Command line options: `--data CSV`, `--user NAME`, `--log`, `--ascii`, `--config FILE`, `--check`, `--version`.
-The environment variable `TREELI_DATA` also sets the switch list.
+| Command line | Effect |
+|---|---|
+| `--data CSV` | use another switch list (also: environment variable `TREELI_DATA`) |
+| `--user NAME` | pre-fill the username |
+| `--log` | turn on [session logging](#session-logging) |
+| `--ascii` | plain ASCII instead of lines and symbols ([why](#colours-and-symbols)) |
+| `--check` | check config, switch list and required tools, then exit |
+| `--version` | show the version |
 
-### Session logging (off by default)
+## Team setup
 
-Start with `tree-li --log` or set `session_log = yes`. Each ssh session is written to
-`~/.local/state/tree-li/logs/<date>-<time>_<switch>.log` (mode 0600, only you can read it).
-The log contains what was shown on screen. The password TRee-Li types is never in it.
-Be aware that commands like `show running-config` can include secrets.
+No system-wide install is needed. Put the TRee-Li directory where your colleagues can read it, e.g.
+`/srv/netops/tree-li`, together with one `data.csv` and an optional `tree-li.conf` for team defaults.
+Everyone runs the same `tree-li`. Passwords, favourites, history and logs stay per user.
 
-## Security notes
+## Single-file bundle
 
-- The password is kept **only in the memory** of the running TRee-Li process. It never goes to disk,
-  command-line arguments or environment variables, and other users can't see it in `ps`.
-  Quitting TRee-Li forgets it.
-- TRee-Li types the password **only once per connection**, and only at a real password prompt.
-  It never answers SSH-key passphrase prompts. When a password is wrong,
-  ssh is stopped right away instead of retrying, the stored password is wiped and you are asked again.
-  This protects a central (TACACS+/RADIUS) account from being locked out.
-- Once you type anything in a session, TRee-Li stops watching the output. A later
-  `Password:` prompt on the switch is never answered automatically.
-- New switches are added to `~/.ssh/known_hosts` automatically (`accept-new`).
-  If a switch's host key **changes**, ssh refuses the connection and TRee-Li asks before removing the old key.
-  That's expected after a hardware swap, but can also mean an attack.
-- Values from the CSV are never passed through a shell. Hosts that look like command-line options
-  (e.g. `-oProxyCommand=...`) are rejected.
+To move TRee-Li without git, e.g. as a mail attachment, pack it into one plain-text file:
+
+```bash
+python3 tools/make-bundle.py          # creates dist/tree-li-bundle-<version>.py
+```
+
+On the server:
+
+```bash
+python3 tree-li-bundle-<version>.py             # unpacks into ./tree-li
+python3 tree-li-bundle-<version>.py /srv/tree-li   # or into another directory
+python3 tree-li-bundle-<version>.py --list      # only show what's inside
+```
+
+- **Damage check:** the bundle carries a checksum, so a damaged attachment is detected before anything is written.
+- **Updates:** running a newer bundle over an existing copy updates it.
+- **Your files stay put:** `data.csv` and `tree-li.conf` are never part of a bundle and are never overwritten.
+
+## Session logging
+
+Off by default. Turn it on with `--log` or `session_log = yes`. Each ssh session is written to
+`~/.local/state/tree-li/logs/<date>-<time>_<switch>.log`, readable only by you.
+The log contains what was on screen, never the password TRee-Li typed. Commands like
+`show running-config` can still put secrets into it.
+
+## Colours and symbols
+
+- **Colours:** shades of blue with small orange/green/red highlights ([STYLE.md](STYLE.md)).
+  256 colours in Tabby or with `TERM=xterm-256color`, 8 colours in PuTTY's default `TERM=xterm`,
+  and bold/reverse on terminals without colour.
+- **Symbols:** lines and symbols use Unicode on UTF-8 terminals. If they look garbled, use `--ascii` or `charset = ascii`.
+
+## Security
+
+- **Memory only.** The password lives only in the memory of the running TRee-Li. It never goes to disk,
+  command lines or environment variables, so it isn't visible in `ps`.
+- **Typed once, only at a real prompt.** TRee-Li types it once per connection, only at a real password prompt,
+  and never at an SSH-key passphrase prompt.
+- **Wrong password:** ssh is stopped right away instead of retrying, the stored password is wiped,
+  and you're asked again. This protects a central (TACACS+/RADIUS) account from lockouts.
+- **Once you type in a session,** TRee-Li stops watching. A later `Password:` prompt on the switch is never answered for you.
+- **Host keys:** new switches are added to `~/.ssh/known_hosts` automatically. If a key **changes**,
+  TRee-Li asks before removing the old one. That's expected after a hardware swap, but can also mean an attack.
+- **CSV values** never pass through a shell, and hosts that look like command-line options (`-o...`) are rejected.
 
 ## Troubleshooting
 
 | Problem | Fix |
 |---|---|
 | `switch list not found` | `cp data.example.csv data.csv`, or set `data =` in `tree-li.conf` |
-| Old switch: `no matching key exchange method` / `host key type` | Add e.g. `ssh_options = -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa` in `tree-li.conf`. On RHEL 9 the system crypto policy may also need to allow SHA-1 |
-| F-keys don't sort | Use `Tab` / `Shift-Tab` |
-| Lines or symbols look garbled (`â”€`, `?`) | Start with `tree-li --ascii`, or set `charset = ascii` in `tree-li.conf`. In PuTTY you can also set *Window > Translation* to UTF-8 |
-| Only a few colours in PuTTY | Set *Connection > Data > Terminal-type string* to `xterm-256color` |
-| Garbled screen | Press `Ctrl-L`, or check that `TERM` is set (`xterm-256color` for Tabby, `xterm` for PuTTY) |
-| Check everything at once | `tree-li --check` |
+| `python3\r: No such file or directory` or `Permission denied` after copying via Windows | `sed -i 's/\r$//' tree-li; chmod +x tree-li`, or start it with `python3 tree-li` |
+| Old switch: `no matching key exchange method` / `host key type` | e.g. `ssh_options = -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa`. On RHEL 9 the system crypto policy may also need to allow SHA-1 |
+| Lines or symbols look like `â”€` or `?` | `--ascii` / `charset = ascii`, or PuTTY *Window → Translation* → UTF-8 |
+| Only a few colours in PuTTY | PuTTY *Connection → Data → Terminal-type string* → `xterm-256color` |
+| F-keys don't sort | `Tab` / `Shift-Tab` |
+| Screen garbled | `Ctrl-L` |
+| Not sure what's wrong | `tree-li --check` |
 
 ## Development
-
-Colours, symbols and layout rules: [STYLE.md](STYLE.md).
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-`tests/fake_ssh.py` acts as a switch (password `secret`, a changed host key, a timeout).
-To use it, point `ssh_command` at it in a test config.
+- `tests/fake_ssh.py` acts as a switch (password `secret`, a changed host key, a timeout).
+  Point `ssh_command` at it in a test config.
+- Design rules: [STYLE.md](STYLE.md). Decisions and background: [`council/`](council/).
