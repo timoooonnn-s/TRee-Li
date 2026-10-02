@@ -1,0 +1,30 @@
+Name;IP;subnet;aliases;comment;type;id;responsible;aix_server
+lab-loopback;127.0.0.1;lab;Local test entry;answers ping;lab;000;Timmy;-
+ber-core-01;192.0.2.1;ber;Core switch Berlin;5520;core;101;Ruffy;-
+ber-dist-01;192.0.2.2;ber;Distribution switch Berlin;5420;dist;102;Timmy;-
+ber-dist-02;192.0.2.3;ber;Distribution switch Berlin;VSP4900;dist;103;Timmy;-
+ber-dist-03;192.0.2.4;ber;Distribution switch Berlin;5520;dist;104;Timmy;-
+ber-acc-01;192.0.2.5;ber;Access switch Berlin;VSP7400;acc;105;Timmy;-
+ber-acc-02;192.0.2.6;ber;Access switch Berlin;VSP4900;acc;106;Bob;-
+ber-acc-03;192.0.2.7;ber;Access switch Berlin;5420;acc;107;Timmy;-
+muc-core-01;192.0.2.8;muc;Core switch Munich;VSP7400;core;108;Timmy;-
+muc-dist-01;192.0.2.9;muc;Distribution switch Munich;5420;dist;109;Timmy;-
+muc-dist-02;192.0.2.10;muc;Distribution switch Munich;VSP4900;dist;110;Ruffy;-
+muc-dist-03;192.0.2.11;muc;Distribution switch Munich;VSP4900;dist;111;Bob;-
+muc-acc-01;192.0.2.12;muc;Access switch Munich;VSP4900;acc;112;Ruffy;-
+muc-acc-02;192.0.2.13;muc;Access switch Munich;VSP4900;acc;113;Ruffy;-
+muc-acc-03;192.0.2.14;muc;Access switch Munich;5520;acc;114;Bob;-
+ham-core-01;198.51.100.15;ham;Core switch Hamburg;VSP7400;core;115;Timmy;-
+ham-dist-01;198.51.100.16;ham;Distribution switch Hamburg;5520;dist;116;Ruffy;-
+ham-dist-02;198.51.100.17;ham;Distribution switch Hamburg;VSP4900;dist;117;Ruffy;-
+ham-dist-03;198.51.100.18;ham;Distribution switch Hamburg;5520;dist;118;Timmy;-
+ham-acc-01;198.51.100.19;ham;Access switch Hamburg;VSP4900;acc;119;Timmy;-
+ham-acc-02;198.51.100.20;ham;Access switch Hamburg;VSP7400;acc;120;Bob;-
+ham-acc-03;198.51.100.21;ham;Access switch Hamburg;5420;acc;121;Alice;-
+zrh-core-01;198.51.100.22;zrh;Core switch Zurich;5420;core;122;Bob;-
+zrh-dist-01;198.51.100.23;zrh;Distribution switch Zurich;5520;dist;123;Alice;-
+zrh-dist-02;198.51.100.24;zrh;Distribution switch Zurich;VSP7400;dist;124;Ruffy;-
+zrh-dist-03;198.51.100.25;zrh;Distribution switch Zurich;VSP7400;dist;125;Timmy;-
+zrh-acc-01;198.51.100.26;zrh;Access switch Zurich;5520;acc;126;Bob;-
+zrh-acc-02;198.51.100.27;zrh;Access switch Zurich;5520;acc;127;Bob;-
+zrh-acc-03;198.51.100.28;zrh;Access switch Zurich;5520;acc;128;Timmy;-

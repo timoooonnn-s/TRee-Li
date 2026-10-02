@@ -1,0 +1,1643 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+TRee-Li: Switch Manager
+
+A terminal (curses) switch manager for use over plain SSH sessions.
+Inspired by V-Li: Switch Manager (github.com/seismicindustries/switch-manager).
+
+Python 3.6+, standard library only.  Run `tree-li --help`.
+"""
+
+import argparse
+import codecs
+import configparser
+import csv
+import curses
+import errno
+import fcntl
+import functools
+import getpass
+import io
+import locale
+import os
+import pty
+import re
+import select
+import shlex
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+import warnings
+
+VERSION = "1.0.0"
+TITLE = "TRee-Li: Switch Manager"
+SCRIPT_DIR = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
+CONFIG_NAME = "tree-li.conf"
+CONFIG_SECTION = "tree-li"
+COMMANDS = ["ssh", "ping", "traceroute", "batch ping", "details", "help", "exit"]
+
+PING_UP, PING_DOWN, PING_WAIT = "UP", "DOWN", "..."
+PING_LABEL = "Ping"
+
+# fork() while batch-ping threads run raises a DeprecationWarning on Python 3.12+.
+# The child execs immediately, so it is safe; the warning would only garble the screen.
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+DEFAULTS = {
+    "data": "data.csv",
+    "delimiter": "auto",
+    "columns": "Name, IP, subnet, aliases:Alias, comment",
+    "host_column": "IP",
+    "name_column": "Name",
+    "user": "",
+    "ssh_command": "ssh",
+    "ssh_options": "",
+    "connect_timeout": "10",
+    "session_log": "no",
+    "log_dir": "~/.local/state/tree-li/logs",
+    "ping_workers": "64",
+    "ping_timeout": "1",
+    "trace_command": "auto",
+}
+
+DELIMITERS = {"auto": None, "tab": "\t", "\\t": "\t", "semicolon": ";", "comma": ",", "pipe": "|"}
+
+
+class ConfigError(Exception):
+    pass
+
+
+class DataError(Exception):
+    pass
+
+
+class Config(object):
+    """Resolved settings; see tree-li.conf for documentation of every option."""
+
+
+def parse_bool(value, option):
+    v = value.strip().lower()
+    if v in ("1", "yes", "true", "on"):
+        return True
+    if v in ("", "0", "no", "false", "off"):
+        return False
+    raise ConfigError("%s: expected yes or no, got '%s'" % (option, value))
+
+
+def parse_int(value, option, lo, hi):
+    try:
+        n = int(value)
+    except ValueError:
+        raise ConfigError("%s: expected a number, got '%s'" % (option, value))
+    if not lo <= n <= hi:
+        raise ConfigError("%s: must be between %d and %d" % (option, lo, hi))
+    return n
+
+
+def parse_columns(spec):
+    """'Name, aliases:Alias' -> [('Name', 'Name'), ('aliases', 'Alias')]"""
+    columns = []
+    for part in spec.split(","):
+        key, _, label = part.partition(":")
+        key, label = key.strip(), label.strip()
+        if key:
+            columns.append((key, label or key))
+    if not columns:
+        raise ConfigError("columns: at least one column is required")
+    return columns
+
+
+def valid_user(user):
+    return bool(user) and not user.startswith("-") and re.match(r"^[^\s\x00-\x1f\x7f@]+$", user) is not None
+
+
+def default_user():
+    try:
+        return getpass.getuser()
+    except Exception:
+        return os.environ.get("USER", "")
+
+
+def user_config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "tree-li", CONFIG_NAME)
+
+
+def load_config(args):
+    """Defaults <- tree-li.conf next to the script <- ~/.config/tree-li/tree-li.conf
+    <- --config FILE <- environment (TREELI_DATA) <- command line."""
+    raw = dict(DEFAULTS)
+    data_base = SCRIPT_DIR
+    candidates = [os.path.join(SCRIPT_DIR, CONFIG_NAME), user_config_path()]
+    if args.config:
+        if not os.path.isfile(args.config):
+            raise ConfigError("config file not found: %s" % args.config)
+        candidates.append(args.config)
+
+    cfg = Config()
+    cfg.files = []
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                parser.read_file(f, source=path)
+        except (configparser.Error, OSError, UnicodeDecodeError) as e:
+            raise ConfigError("cannot read %s: %s" % (path, e))
+        if not parser.has_section(CONFIG_SECTION):
+            raise ConfigError("%s: missing the [%s] section" % (path, CONFIG_SECTION))
+        for key, value in parser.items(CONFIG_SECTION):
+            if key not in DEFAULTS:
+                raise ConfigError("%s: unknown option '%s'" % (path, key))
+            raw[key] = value.strip()
+            if key == "data":
+                data_base = os.path.dirname(os.path.abspath(path))
+        cfg.files.append(path)
+
+    data = raw["data"] or DEFAULTS["data"]
+    if os.environ.get("TREELI_DATA"):
+        data, data_base = os.environ["TREELI_DATA"], os.getcwd()
+    if args.data:
+        data, data_base = args.data, os.getcwd()
+    # Relative paths are resolved against the config file / script, never the CWD.
+    cfg.data = os.path.normpath(os.path.join(data_base, os.path.expanduser(data)))
+
+    delim = raw["delimiter"]
+    if delim.lower() in DELIMITERS:
+        cfg.delimiter = DELIMITERS[delim.lower()]
+    elif len(delim) == 1:
+        cfg.delimiter = delim
+    else:
+        raise ConfigError("delimiter: use auto, ';', ',', '|' or tab")
+
+    cfg.columns = parse_columns(raw["columns"])
+    cfg.host_column = raw["host_column"] or DEFAULTS["host_column"]
+    cfg.name_column = raw["name_column"] or DEFAULTS["name_column"]
+    cfg.user = args.user or raw["user"] or default_user()
+    if cfg.user and not valid_user(cfg.user):
+        raise ConfigError("user: '%s' is not a valid user name" % cfg.user)
+    try:
+        cfg.ssh_command = shlex.split(raw["ssh_command"]) or ["ssh"]
+        cfg.ssh_options = shlex.split(raw["ssh_options"])
+    except ValueError as e:
+        raise ConfigError("ssh_command/ssh_options: %s" % e)
+    cfg.connect_timeout = parse_int(raw["connect_timeout"], "connect_timeout", 1, 300)
+    cfg.session_log = args.log or parse_bool(raw["session_log"], "session_log")
+    cfg.log_dir = os.path.abspath(os.path.expanduser(raw["log_dir"]))
+    cfg.ping_workers = parse_int(raw["ping_workers"], "ping_workers", 1, 256)
+    cfg.ping_timeout = parse_int(raw["ping_timeout"], "ping_timeout", 1, 30)
+    cfg.trace_command = raw["trace_command"] or "auto"
+    return cfg
+
+
+# --------------------------------------------------------------------------
+# Switch list (CSV)
+# --------------------------------------------------------------------------
+
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def clean(value):
+    return CONTROL_CHARS.sub(" ", value or "").strip()
+
+
+def read_text(path):
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        raise DataError("cannot read %s: %s" % (path, e.strerror or e))
+    # UTF-8 (with or without BOM) first, then what Excel on Windows writes.
+    for encoding in ("utf-8-sig", "cp1252"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            pass
+    return raw.decode("latin-1")
+
+
+def detect_delimiter(header_line):
+    best, count = ";", 0
+    for d in (";", ",", "\t", "|"):
+        c = header_line.count(d)
+        if c > count:
+            best, count = d, c
+    return best
+
+
+def read_table(path, delimiter=None):
+    """Return (headers, rows); every row is a dict header -> cleaned value.
+    Blank lines and lines starting with '#' are ignored."""
+    if not os.path.isfile(path):
+        hint = ""
+        if os.path.isfile(os.path.join(SCRIPT_DIR, "data.example.csv")):
+            hint = " - copy data.example.csv to data.csv to start"
+        raise DataError("switch list not found: %s%s" % (path, hint))
+    text = read_text(path)
+    first = next((line for line in text.splitlines() if line.strip()), None)
+    if first is None:
+        raise DataError("switch list is empty: %s" % path)
+    reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter or detect_delimiter(first))
+    headers, rows = None, []
+    try:
+        for record in reader:
+            if not any(cell.strip() for cell in record) or record[0].lstrip().startswith("#"):
+                continue
+            if headers is None:
+                headers, seen = [], set()
+                for i, h in enumerate(record):
+                    h = clean(h) or "column%d" % (i + 1)
+                    while h.lower() in seen:
+                        h += "_"
+                    seen.add(h.lower())
+                    headers.append(h)
+                continue
+            rows.append(dict((h, clean(record[i]) if i < len(record) else "") for i, h in enumerate(headers)))
+    except csv.Error as e:
+        raise DataError("%s, line %d: %s" % (path, reader.line_num, e))
+    if headers is None:
+        raise DataError("switch list has no header line: %s" % path)
+    return headers, rows
+
+
+class Device(object):
+    __slots__ = ("values", "host", "name", "cells", "search")
+
+
+def find_header(headers, wanted):
+    wanted = wanted.strip().lower()
+    for h in headers:
+        if h.lower() == wanted:
+            return h
+    return None
+
+
+def build_devices(headers, rows, cfg):
+    """Return (devices, columns, warnings); columns are (header, label) pairs."""
+    warns = []
+    host_h = find_header(headers, cfg.host_column)
+    if host_h is None:
+        for alt in ("ip", "host", "hostname", "address", "ip address"):
+            host_h = find_header(headers, alt)
+            if host_h:
+                break
+    if host_h is None:
+        raise DataError("no '%s' column in the switch list (found: %s)" % (cfg.host_column, ", ".join(headers)))
+    name_h = find_header(headers, cfg.name_column) or headers[0]
+
+    columns = []
+    for key, label in cfg.columns:
+        h = find_header(headers, key)
+        if h is None:
+            warns.append("column '%s' not found in the switch list" % key)
+        else:
+            columns.append((h, label))
+    if not columns:
+        columns = [(name_h, name_h), (host_h, host_h)]
+
+    devices = []
+    for row in rows:
+        d = Device()
+        d.values = row
+        d.host = row.get(host_h, "")
+        d.name = row.get(name_h, "") or d.host
+        d.cells = [row.get(h, "") for h, _ in columns]
+        d.search = "\x00".join(d.cells).lower()   # \x00: a token never matches across fields
+        devices.append(d)
+    return devices, columns, warns
+
+
+def filter_devices(devices, query):
+    """Whitespace separated tokens, all must match (case-insensitive substring)."""
+    tokens = query.lower().split()
+    if not tokens:
+        return list(devices)
+    return [d for d in devices if all(t in d.search for t in tokens)]
+
+
+def natural_key(text):
+    """'sw2' < 'sw10', '10.0.1.2' < '10.0.1.10'."""
+    key = []
+    for i, part in enumerate(re.split(r"([0-9]+)", text.lower())):
+        if i % 2:
+            key.append((0, int(part), ""))
+        elif part:
+            key.append((1, 0, part))
+    return key
+
+
+PING_RANK = {PING_DOWN: 0, PING_UP: 1, PING_WAIT: 2}
+
+
+def sort_devices(devices, col, desc, ping_states):
+    """col indexes the visible columns; col == len(cells) is the Ping column.
+    Empty values always go last."""
+    if col is None or not devices:
+        return list(devices)
+    if col >= len(devices[0].cells):
+        def value(d):
+            return ping_states.get(d.host, "")
+        key = lambda d: PING_RANK.get(value(d), 9)
+    else:
+        def value(d):
+            return d.cells[col]
+        key = lambda d: natural_key(value(d))
+    filled = [d for d in devices if value(d)]
+    empty = [d for d in devices if not value(d)]
+    return sorted(filled, key=key, reverse=desc) + empty
+
+
+# --------------------------------------------------------------------------
+# External commands
+# --------------------------------------------------------------------------
+
+HOST_RE = re.compile(r"^[A-Za-z0-9_.:%-]+$")
+
+
+def valid_host(host):
+    """Hosts come from a shared CSV: never let one look like a command line option."""
+    return bool(host) and len(host) <= 253 and not host.startswith("-") and HOST_RE.match(host) is not None
+
+
+@functools.lru_cache(maxsize=None)
+def which(cmd):
+    path = os.environ.get("PATH", os.defpath) + os.pathsep + "/usr/sbin" + os.pathsep + "/sbin"
+    return shutil.which(cmd, path=path)
+
+
+def ping_argv(host, count, timeout):
+    wait = timeout * 1000 if sys.platform == "darwin" else timeout   # macOS: -W is in ms
+    return [which("ping") or "ping", "-n", "-c", str(count), "-W", str(wait), host]
+
+
+def trace_argv(cfg, host):
+    if cfg.trace_command == "auto":
+        for cmd in ("traceroute", "tracepath"):
+            path = which(cmd)
+            if path:
+                return [path, "-n", host]
+        return None
+    return shlex.split(cfg.trace_command) + [host]
+
+
+def ping_once(host, timeout):
+    try:
+        return subprocess.call(ping_argv(host, 1, timeout), stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=timeout + 5) == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+class BatchPing(object):
+    """Pings many hosts with a bounded number of worker threads."""
+
+    def __init__(self, hosts, workers, timeout, states):
+        self.hosts, self.states, self.timeout = hosts, states, timeout
+        self.total, self.done, self.up, self.down = len(hosts), 0, 0, 0
+        self.cancelled = self.reported = False
+        self._next = 0
+        self._lock = threading.Lock()
+        for h in hosts:
+            states[h] = PING_WAIT
+        self.threads = [threading.Thread(target=self._work) for _ in range(min(workers, self.total))]
+        for t in self.threads:
+            t.daemon = True
+            t.start()
+
+    def _work(self):
+        while True:
+            with self._lock:
+                if self.cancelled or self._next >= self.total:
+                    return
+                host = self.hosts[self._next]
+                self._next += 1
+            ok = ping_once(host, self.timeout)
+            with self._lock:
+                self.states[host] = PING_UP if ok else PING_DOWN
+                self.done += 1
+                if ok:
+                    self.up += 1
+                else:
+                    self.down += 1
+
+    @property
+    def running(self):
+        return any(t.is_alive() for t in self.threads)
+
+    def cancel(self):
+        with self._lock:
+            self.cancelled = True
+            for h in self.hosts[self._next:]:
+                if self.states.get(h) == PING_WAIT:
+                    del self.states[h]
+
+
+class ProcStream(object):
+    """Runs a command in a pseudo-terminal (so its output is line buffered)
+    and collects the output lines in a background thread."""
+
+    def __init__(self, argv):
+        self.lines = ["$ " + " ".join(shlex.quote(a) for a in argv), ""]
+        self.partial = ""
+        self.done = False
+        self.returncode = None
+        self.proc = None
+        self._lock = threading.Lock()
+        master = slave = None
+        try:
+            master, slave = pty.openpty()
+            self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=slave, stderr=slave,
+                                         start_new_session=True)
+        except OSError as e:
+            for fd in (master, slave):
+                if fd is not None:
+                    os.close(fd)
+            self.lines.append("cannot run %s: %s" % (argv[0], e.strerror or e))
+            self.returncode, self.done = 127, True
+            return
+        os.close(slave)
+        self._master = master
+        t = threading.Thread(target=self._reader)
+        t.daemon = True
+        t.start()
+
+    def _reader(self):
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        while True:
+            try:
+                data = os.read(self._master, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            self._feed(decoder.decode(data))
+        os.close(self._master)
+        rc = self.proc.wait()
+        with self._lock:
+            if self.partial:
+                self.lines.append(self.partial)
+                self.partial = ""
+            self.lines += ["", "[finished, exit code %d]" % rc]
+            self.returncode = rc
+            self.done = True
+
+    def _feed(self, text):
+        with self._lock:
+            parts = (self.partial + text.replace("\r\n", "\n")).split("\n")
+            self.partial = parts.pop()
+            for line in parts:
+                # keep only what a terminal would show after a carriage return
+                self.lines.append(CONTROL_CHARS.sub(" ", line.split("\r")[-1]).rstrip())
+
+    def snapshot(self):
+        with self._lock:
+            return self.lines + ([self.partial] if self.partial else [])
+
+    def stop(self):
+        if self.proc is not None and self.proc.poll() is None:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(self.proc.pid, sig)
+                    self.proc.wait(timeout=1)
+                    break
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+
+
+# --------------------------------------------------------------------------
+# Interactive SSH session in a pseudo-terminal
+# --------------------------------------------------------------------------
+
+PASSWORD_PROMPT = re.compile(r"password[^\r\n]*:\s*$", re.IGNORECASE)
+OFFENDING_KEY = re.compile(r"Offending \S+ key in (.+):\d+\s*$", re.MULTILINE)
+# Last lines that mean "ssh could not (or no longer) talk to the switch", as opposed
+# to a normal logout ("Connection to x closed by remote host.").
+SSH_FAILURE = re.compile(r"Permission denied|Connection (timed out|refused|reset)|No route to host|"
+                         r"Could not resolve|Name or service not known|Network is unreachable|"
+                         r"Host key verification failed|no matching|Too many authentication failures|"
+                         r"not responding|Broken pipe|cannot run", re.IGNORECASE)
+ANSI_ESCAPES = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-Za-z]|\x1b[=>78]|\r")
+
+
+def is_password_prompt(line):
+    """True for 'Password:' / "user@host's password:", never for key passphrases."""
+    return PASSWORD_PROMPT.search(line) is not None and "passphrase" not in line.lower()
+
+
+def build_ssh_argv(cfg, user, host, inject_password):
+    # ssh uses the FIRST value it sees for an option: user options go first so they win.
+    argv = list(cfg.ssh_command) + list(cfg.ssh_options)
+    argv += ["-o", "StrictHostKeyChecking=accept-new",
+             "-o", "ConnectTimeout=%d" % cfg.connect_timeout,
+             "-o", "ServerAliveInterval=15",
+             "-o", "ServerAliveCountMax=3"]
+    if inject_password:
+        # One try only: a wrong password must never be repeated (account lockout).
+        argv += ["-o", "NumberOfPasswordPrompts=1"]
+    if user:
+        argv += ["-l", user]
+    return argv + ["--", host]
+
+
+class SessionResult(object):
+    def __init__(self):
+        self.exit_code = None
+        self.password_sent = False
+        self.auth_failed = False
+        self.hostkey_changed = False
+        self.user_typed = False      # keystrokes after the login (or at all, without auto-login)
+        self.known_hosts = None      # file named in ssh's "Offending ... key in FILE:N"
+        self.last_line = ""
+
+    @property
+    def failed(self):
+        """ssh could not connect / log in, or the session died - not a normal logout."""
+        if self.exit_code == 0:
+            return False
+        return not self.user_typed or SSH_FAILURE.search(self.last_line) is not None
+
+
+def _write_all(fd, data):
+    while data:
+        try:
+            n = os.write(fd, data)
+        except InterruptedError:
+            continue
+        except OSError as e:
+            if e.errno == errno.EAGAIN:
+                select.select([], [fd], [], 1.0)
+                continue
+            raise
+        data = data[n:]
+
+
+def _copy_winsize(src_fd, dst_fd):
+    try:
+        fcntl.ioctl(dst_fd, termios.TIOCSWINSZ, fcntl.ioctl(src_fd, termios.TIOCGWINSZ, b"\0" * 8))
+    except OSError:
+        pass
+
+
+def _exit_code(status):
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return 255
+
+
+def _reap(pid, grace=2.0):
+    """Wait for the child; escalate to SIGTERM / SIGKILL if it does not go away."""
+    deadline = time.time() + grace
+    for sig in (None, signal.SIGTERM, signal.SIGKILL):
+        if sig is not None:
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+            deadline = time.time() + grace
+        while time.time() < deadline:
+            try:
+                wpid, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return 255
+            if wpid:
+                return _exit_code(status)
+            time.sleep(0.05)
+    return 255
+
+
+def run_session(argv, password=None, log=None, in_fd=None, out_fd=None):
+    """Run argv (ssh) in a pseudo-terminal connected to our terminal.
+
+    If a password is given it is typed once, at the first password prompt,
+    as long as the user has not typed anything yet.  A second password prompt
+    means the login failed: the session is aborted instead of retrying.
+    Login problems (wrong password, changed host key) are only detected in the
+    output before the user's first keystroke, never in the session itself."""
+    in_fd = sys.stdin.fileno() if in_fd is None else in_fd
+    out_fd = sys.stdout.fileno() if out_fd is None else out_fd
+    result = SessionResult()
+    try:
+        termios.tcflush(in_fd, termios.TCIFLUSH)    # drop typeahead, e.g. a double Enter
+    except termios.error:
+        pass
+    try:
+        winsize = fcntl.ioctl(in_fd, termios.TIOCGWINSZ, b"\0" * 8)
+    except OSError:
+        winsize = None
+
+    pid, master = pty.fork()
+    if pid == 0:   # child: becomes ssh
+        try:
+            signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+            if winsize:
+                fcntl.ioctl(0, termios.TIOCSWINSZ, winsize)
+            os.execvp(argv[0], argv)
+        except BaseException as e:
+            try:
+                os.write(2, ("TRee-Li: cannot run %s: %s\r\n" % (argv[0], e)).encode())
+            except Exception:
+                pass
+        os._exit(127)
+
+    old_attrs = None
+    try:
+        old_attrs = termios.tcgetattr(in_fd)
+        tty.setraw(in_fd)
+    except termios.error:
+        pass
+    old_winch = signal.signal(signal.SIGWINCH, lambda signum, frame: _copy_winsize(in_fd, master))
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    armed = bool(password)       # watching for the password prompt
+    tail = captured = before_input = ""
+    exit_code = None
+    try:
+        while True:
+            ready = select.select([master, in_fd], [], [], 1.0)[0]
+            if master in ready:
+                try:
+                    data = os.read(master, 65536)
+                except OSError as e:
+                    if e.errno in (errno.EIO, errno.EBADF):
+                        break          # Linux: slave side closed, ssh is gone
+                    raise
+                if not data:
+                    break
+                _write_all(out_fd, data)
+                if log is not None:
+                    try:
+                        log.write(ANSI_ESCAPES.sub(b"", data))
+                        log.flush()
+                    except OSError:
+                        log = None
+                text = decoder.decode(data)
+                captured = (captured + text)[-16384:]
+                if not result.user_typed:
+                    before_input = (before_input + text)[-16384:]
+                if armed:
+                    tail = (tail + text)[-1024:]
+                    if is_password_prompt(re.split(r"[\r\n]", tail)[-1]):
+                        tail = ""
+                        if result.password_sent:
+                            result.auth_failed = True
+                            armed = False
+                            try:
+                                os.kill(pid, signal.SIGTERM)
+                            except OSError:
+                                pass
+                        else:
+                            _write_all(master, password.encode("utf-8") + b"\r")
+                            result.password_sent = True
+            if in_fd in ready:
+                try:
+                    data = os.read(in_fd, 4096)
+                except OSError:
+                    data = b""
+                if not data:           # our own terminal is gone
+                    break
+                armed = False          # the user took over: never type the password again
+                if result.password_sent or not password:
+                    result.user_typed = True
+                try:
+                    _write_all(master, data)
+                except OSError:
+                    pass
+            if not ready:
+                # ssh may have exited while something else keeps the pty open (ControlPersist).
+                try:
+                    wpid, status = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    wpid, status = pid, 255 << 8
+                if wpid:
+                    exit_code = _exit_code(status)
+                    break
+    finally:
+        signal.signal(signal.SIGWINCH, old_winch)
+        if old_attrs is not None:
+            termios.tcsetattr(in_fd, termios.TCSADRAIN, old_attrs)
+        if exit_code is None:
+            exit_code = _reap(pid)
+        os.close(master)
+
+    result.exit_code = exit_code
+    if result.password_sent and exit_code == 255 and "Permission denied" in before_input:
+        result.auth_failed = True
+    result.hostkey_changed = "REMOTE HOST IDENTIFICATION HAS CHANGED" in before_input
+    m = OFFENDING_KEY.search(before_input.replace("\r", ""))
+    if m:
+        result.known_hosts = m.group(1).strip()
+    lines = [clean(l) for l in ANSI_ESCAPES.sub(b"", captured.encode("utf-8", "replace"))
+             .decode("utf-8", "replace").split("\n")]
+    lines = [l for l in lines if l]
+    result.last_line = lines[-1] if lines else ""
+    return result
+
+
+def remove_host_key(host, known_hosts):
+    """ssh-keygen -R; returns (removed, output).  ssh-keygen exits 0 even when
+    the host was not in the file, so that case is detected from its output."""
+    try:
+        proc = subprocess.Popen(["ssh-keygen", "-R", host, "-f", known_hosts], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        output = proc.communicate()[0].decode("utf-8", "replace").strip()
+    except OSError as e:
+        return False, "cannot run ssh-keygen: %s" % e
+    if proc.returncode != 0 or "not found" in output:
+        return False, output or "ssh-keygen exit code %d" % proc.returncode
+    return True, output
+
+
+def terminal_size():
+    try:
+        rows, cols = struct.unpack("hhhh", fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8))[:2]
+        if rows > 0 and cols > 0:
+            return rows, cols
+    except OSError:
+        pass
+    return None
+
+
+def terminal_wait_key(prompt):
+    """Outside of curses: print prompt, return one key press (bytes)."""
+    os.write(sys.stdout.fileno(), prompt.encode("utf-8", "replace"))
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        termios.tcflush(fd, termios.TCIFLUSH)
+        ch = os.read(fd, 1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    os.write(sys.stdout.fileno(), b"\r\n")
+    return ch
+
+
+# --------------------------------------------------------------------------
+# Keyboard: curses keypad plus our own escape-sequence parser, so PuTTY's
+# default F-keys (ESC[11~), the Linux console and Tabby all work.
+# --------------------------------------------------------------------------
+
+CURSES_KEYS = {
+    curses.KEY_UP: "UP", curses.KEY_DOWN: "DOWN", curses.KEY_LEFT: "LEFT", curses.KEY_RIGHT: "RIGHT",
+    curses.KEY_PPAGE: "PGUP", curses.KEY_NPAGE: "PGDN", curses.KEY_HOME: "HOME", curses.KEY_END: "END",
+    curses.KEY_FIND: "HOME", curses.KEY_SELECT: "END", curses.KEY_ENTER: "ENTER",
+    curses.KEY_BACKSPACE: "BACKSPACE", curses.KEY_DC: "DELETE", curses.KEY_BTAB: "BTAB",
+    curses.KEY_RESIZE: "RESIZE",
+}
+for _n in range(1, 13):
+    CURSES_KEYS[curses.KEY_F0 + _n] = "F%d" % _n
+
+ESC_SEQUENCES = {
+    "[A": "UP", "[B": "DOWN", "[C": "RIGHT", "[D": "LEFT",
+    "OA": "UP", "OB": "DOWN", "OC": "RIGHT", "OD": "LEFT",
+    "[H": "HOME", "[F": "END", "OH": "HOME", "OF": "END",
+    "[1~": "HOME", "[7~": "HOME", "[4~": "END", "[8~": "END",
+    "[5~": "PGUP", "[6~": "PGDN", "[3~": "DELETE", "[Z": "BTAB", "OM": "ENTER",
+    "OP": "F1", "OQ": "F2", "OR": "F3", "OS": "F4",
+    "[11~": "F1", "[12~": "F2", "[13~": "F3", "[14~": "F4", "[15~": "F5",
+    "[17~": "F6", "[18~": "F7", "[19~": "F8", "[20~": "F9", "[21~": "F10",
+    "[23~": "F11", "[24~": "F12",
+    "[[A": "F1", "[[B": "F2", "[[C": "F3", "[[D": "F4", "[[E": "F5",
+}
+
+
+def parse_escape_sequence(seq):
+    """Map the characters after ESC to a key name ('' -> 'ESC', unknown -> None)."""
+    if seq == "":
+        return "ESC"
+    if seq in ESC_SEQUENCES:
+        return ESC_SEQUENCES[seq]
+    m = re.match(r"^\[(\d*)(?:;\d+)+([A-Za-z~])$", seq)    # with modifiers, e.g. ESC[1;5A
+    if m:
+        num, final = m.groups()
+        return ESC_SEQUENCES.get("[%s~" % num if final == "~" else "[" + final)
+    return None
+
+
+def read_key(win, timeout_ms):
+    """Return a key name ('UP', 'F1', 'ENTER', 'CTRL_R', ...), a printable
+    one-character string, or None (timeout / unknown key)."""
+    win.timeout(timeout_ms)
+    try:
+        ch = win.get_wch()
+    except curses.error:
+        return None
+    if isinstance(ch, int):
+        return CURSES_KEYS.get(ch)
+    if ch == "\x1b":
+        seq = ""
+        win.timeout(100)
+        try:
+            while len(seq) < 12:
+                try:
+                    c = win.get_wch()
+                except curses.error:
+                    break
+                if isinstance(c, int) or (not seq and c not in "[O"):
+                    # not an escape sequence: a plain ESC, then another key - keep that key
+                    try:
+                        curses.unget_wch(c)
+                    except (curses.error, OverflowError):
+                        pass
+                    break
+                seq += c
+                if len(seq) >= 2 and (c.isalpha() or c == "~") and seq != "[[":
+                    break
+        finally:
+            win.timeout(timeout_ms)
+        return parse_escape_sequence(seq)
+    if ch in ("\n", "\r"):
+        return "ENTER"
+    if ch in ("\x7f", "\x08"):
+        return "BACKSPACE"
+    if ch == "\t":
+        return "TAB"
+    if ord(ch) < 32:
+        return "CTRL_" + chr(ord(ch) + 64)
+    return ch if ch.isprintable() else None
+
+
+# --------------------------------------------------------------------------
+# Drawing helpers
+# --------------------------------------------------------------------------
+
+def put(win, y, x, text, attr=0):
+    """addstr that never raises: clips at the screen edge, survives odd locales."""
+    h, w = win.getmaxyx()
+    if y < 0 or y >= h or x < 0 or x >= w:
+        return
+    text = text[:w - x]
+    if y == h - 1 and x + len(text) >= w:
+        text = text[:w - x - 1]      # writing the bottom-right cell raises in curses
+    if not text:
+        return
+    try:
+        win.addstr(y, x, text, attr)
+    except (curses.error, UnicodeError, ValueError):
+        try:
+            win.addstr(y, x, text.encode("ascii", "replace").decode("ascii"), attr)
+        except (curses.error, ValueError):
+            pass
+
+
+def fit(text, width):
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text.ljust(width)
+    return text[:width - 1] + "~"
+
+
+def fit_widths(widths, available, minimum=6):
+    widths = list(widths)
+    while sum(widths) > available and max(widths) > minimum:
+        i = widths.index(max(widths))
+        widths[i] -= 1
+    return widths
+
+
+def wrap_lines(lines, width):
+    out = []
+    width = max(10, width)
+    for line in lines:
+        line = line.expandtabs(8)
+        if not line:
+            out.append("")
+        while line:
+            out.append(line[:width])
+            line = line[width:]
+    return out
+
+
+class Styles(object):
+    def __init__(self):
+        b, r = curses.A_BOLD, curses.A_REVERSE
+        self.title = self.active = self.selected = r | b
+        self.header = b | curses.A_UNDERLINE
+        self.status = r
+        self.up = self.down = self.error = b
+        self.wait = self.dim = curses.A_DIM
+        try:
+            if not curses.has_colors():
+                return
+            bg = -1
+            try:
+                curses.use_default_colors()
+            except curses.error:
+                bg = curses.COLOR_BLACK
+            curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
+            curses.init_pair(2, curses.COLOR_GREEN, bg)
+            curses.init_pair(3, curses.COLOR_RED, bg)
+            curses.init_pair(4, curses.COLOR_YELLOW, bg)
+            self.title = self.active = self.selected = curses.color_pair(1) | b
+            self.up = curses.color_pair(2) | b
+            self.down = self.error = curses.color_pair(3) | b
+            self.wait = curses.color_pair(4)
+        except curses.error:
+            pass
+
+
+BANNER = [
+    r" _____  ____                      _      _ ",
+    r"|_   _||  _ \   ___   ___        | |    (_)",
+    r"  | |  | |_) | / _ \ / _ \ _____ | |    | |",
+    r"  | |  |  _ < |  __/|  __/|_____|| |___ | |",
+    r"  |_|  |_| \_\ \___| \___|       |_____||_|",
+]
+
+
+# --------------------------------------------------------------------------
+# The application
+# --------------------------------------------------------------------------
+
+class App(object):
+
+    def __init__(self, scr, cfg):
+        self.scr, self.cfg = scr, cfg
+        self.st = Styles()
+        self.devices, self.view, self.columns, self.widths = [], [], [], []
+        self.cursor = self.top = self.cmd = 0
+        self.body_h = 1
+        self.query = ""
+        self.sort_col, self.sort_desc = None, False
+        self.ping = {}                 # host -> PING_UP / PING_DOWN / PING_WAIT
+        self.batch = None
+        self.creds = None              # (user, password or None) - memory only
+        self.last_user = cfg.user
+        self.msg, self.msg_attr, self.msg_until = "", 0, 0
+        self.load_error = None
+        self.set_cursor(False)
+        self.load()
+
+    # -- helpers ------------------------------------------------------------
+
+    def set_cursor(self, visible):
+        try:
+            curses.curs_set(1 if visible else 0)
+        except curses.error:
+            pass
+
+    def message(self, text, error=False, seconds=6):
+        self.msg = text
+        self.msg_attr = self.st.error if error else 0
+        self.msg_until = time.time() + seconds
+
+    def selected(self):
+        return self.view[self.cursor] if 0 <= self.cursor < len(self.view) else None
+
+    def ncols(self):
+        return len(self.columns) + 1          # + Ping
+
+    def load(self):
+        keep = self.selected()
+        try:
+            headers, rows = read_table(self.cfg.data, self.cfg.delimiter)
+            devices, columns, warns = build_devices(headers, rows, self.cfg)
+        except DataError as e:
+            self.load_error = str(e)
+            self.devices = []
+            self.columns = self.columns or list(self.cfg.columns)
+            self.message(str(e), error=True, seconds=30)
+        else:
+            self.load_error = None
+            self.devices, self.columns = devices, columns
+            if warns:
+                self.message("; ".join(warns), error=True, seconds=15)
+        self.widths = [min(40, max([len(label) + 2] + [len(d.cells[i]) for d in self.devices]))
+                       for i, (_, label) in enumerate(self.columns)]
+        self.widths.append(len(PING_LABEL) + 2)
+        if keep is not None:
+            keep = next((d for d in self.devices if d.host == keep.host and d.name == keep.name), None)
+        self.apply_sort(keep)
+
+    def apply_sort(self, keep=None):
+        self.devices = sort_devices(self.devices, self.sort_col, self.sort_desc, self.ping)
+        self.refilter(keep)
+
+    def refilter(self, keep=None):
+        keep = keep or self.selected()
+        self.view = filter_devices(self.devices, self.query)
+        self.cursor = 0
+        for i, d in enumerate(self.view):
+            if d is keep:
+                self.cursor = i
+                break
+
+    def set_sort(self, col):
+        if col >= self.ncols():
+            return
+        if self.sort_col == col:
+            self.sort_desc = not self.sort_desc
+        else:
+            self.sort_col, self.sort_desc = col, False
+        self.apply_sort()
+
+    def sync_size(self):
+        size = terminal_size()
+        if size and size != self.scr.getmaxyx():
+            try:
+                curses.resizeterm(*size)
+            except curses.error:
+                pass
+        self.scr.clear()
+
+    # -- drawing ------------------------------------------------------------
+
+    def layout(self):
+        h, w = self.scr.getmaxyx()
+        gap = 2 if h >= 20 else 1
+        y_cmd = gap
+        y_search = y_cmd + gap
+        y_head = y_search + gap
+        return h, w, y_cmd, y_search, y_head
+
+    def draw(self, refresh=True):
+        scr, st = self.scr, self.st
+        scr.erase()
+        h, w, y_cmd, y_search, y_head = self.layout()
+        if h < 8 or w < 30:
+            put(scr, 0, 0, "Terminal too small", st.error)
+            put(scr, 1, 0, "(min. 30x8)")
+            if refresh:
+                scr.refresh()
+            return
+
+        put(scr, 0, 0, TITLE.center(w), st.title)
+
+        # command bar
+        cell = max(len(c) for c in COMMANDS) + 2
+        gap = 2
+        if 2 + len(COMMANDS) * (cell + gap) > w:
+            cell, gap = 0, 1
+        if 2 + sum(len(c) + 2 + gap for c in COMMANDS) > w:
+            # too narrow for the whole bar: show only the selected command
+            put(scr, y_cmd, 2, "Command: <")
+            put(scr, y_cmd, 12, " " + COMMANDS[self.cmd] + " ", st.active)
+            put(scr, y_cmd, 14 + len(COMMANDS[self.cmd]), ">")
+        else:
+            x = 2
+            for i, name in enumerate(COMMANDS):
+                text = "[" + name.center(max(cell, len(name) + 2) - 2) + "]"
+                put(scr, y_cmd, x, text, st.active if i == self.cmd else 0)
+                x += len(text) + gap
+
+        # search line
+        put(scr, y_search, 1, "Search: ", curses.A_BOLD)
+        if self.query:
+            put(scr, y_search, 9, self.query[-(w - 12):] + "_")
+        else:
+            put(scr, y_search, 9, "type to filter - all words must match", st.dim)
+
+        # table
+        widths = fit_widths(self.widths, w - 2 - 2 * (len(self.widths) - 1))
+        labels = [label for _, label in self.columns] + [PING_LABEL]
+        x = 1
+        for i, label in enumerate(labels):
+            if i == self.sort_col:
+                label += " v" if self.sort_desc else " ^"
+            put(scr, y_head, x, fit(label, widths[i]), st.header)
+            x += widths[i] + 2
+
+        y_body = y_head + 1
+        self.body_h = body_h = max(1, h - 1 - y_body)
+        if self.cursor >= len(self.view):
+            self.cursor = max(0, len(self.view) - 1)
+        if self.cursor < self.top:
+            self.top = self.cursor
+        elif self.cursor >= self.top + body_h:
+            self.top = self.cursor - body_h + 1
+        self.top = max(0, min(self.top, max(0, len(self.view) - body_h)))
+
+        if not self.view:
+            if self.load_error:
+                text = self.load_error
+            elif self.devices:
+                text = "No switch matches '%s'  (ESC clears the search)" % self.query
+            else:
+                text = "The switch list is empty"
+            put(scr, y_body + 1, 2, text, st.error if self.load_error else st.dim)
+
+        for row in range(body_h):
+            idx = self.top + row
+            if idx >= len(self.view):
+                break
+            d = self.view[idx]
+            y = y_body + row
+            sel = idx == self.cursor
+            if sel:
+                put(scr, y, 0, " " * w, st.selected)
+            x = 1
+            for i, value in enumerate(d.cells):
+                put(scr, y, x, fit(value, widths[i]), st.selected if sel else 0)
+                x += widths[i] + 2
+            state = self.ping.get(d.host, "")
+            if state:
+                attr = {PING_UP: st.up, PING_DOWN: st.down}.get(state, st.wait)
+                put(scr, y, x, fit(state, widths[-1]), st.selected if sel else attr)
+
+        # status line
+        right = "%d/%d switches " % (len(self.view), len(self.devices))
+        if self.creds:
+            right = "user: %s | %s" % (self.creds[0], right)
+        if self.batch and self.batch.running:
+            right = "batch ping %d/%d (ESC cancels) | %s" % (self.batch.done, self.batch.total, right)
+        if time.time() < self.msg_until:
+            left, attr = " " + self.msg, self.msg_attr | curses.A_REVERSE
+        else:
+            left = " Enter: run  Left/Right: command  type: search  F1-F%d/Tab: sort" % self.ncols()
+            attr = st.status
+        put(scr, h - 1, 0, " " * w, st.status)
+        put(scr, h - 1, 0, left[:max(0, w - len(right) - 2)], attr)
+        put(scr, h - 1, max(0, w - len(right) - 1), right, st.status)
+        if refresh:
+            scr.refresh()
+
+    # -- main loop ----------------------------------------------------------
+
+    def run(self):
+        while True:
+            if self.batch and not self.batch.running and not self.batch.reported:
+                self.batch.reported = True
+                if not self.batch.cancelled:
+                    self.message("Batch ping finished: %d UP, %d DOWN  (F%d sorts by Ping)"
+                                 % (self.batch.up, self.batch.down, self.ncols()), seconds=15)
+                if self.sort_col == self.ncols() - 1:
+                    self.apply_sort()
+            self.draw()
+            key = read_key(self.scr, 250)
+            if key is None:
+                continue
+            if self.handle(key) is False:
+                if self.batch:
+                    self.batch.cancel()
+                return
+
+    def handle(self, key):
+        n = len(self.view)
+        if key == "RESIZE":
+            self.sync_size()
+        elif key == "UP":
+            self.cursor = max(0, self.cursor - 1)
+        elif key == "DOWN":
+            self.cursor = min(max(0, n - 1), self.cursor + 1)
+        elif key == "PGUP":
+            self.cursor = max(0, self.cursor - self.body_h)
+        elif key == "PGDN":
+            self.cursor = min(max(0, n - 1), self.cursor + self.body_h)
+        elif key == "HOME":
+            self.cursor = 0
+        elif key == "END":
+            self.cursor = max(0, n - 1)
+        elif key == "LEFT":
+            self.cmd = (self.cmd - 1) % len(COMMANDS)
+        elif key == "RIGHT":
+            self.cmd = (self.cmd + 1) % len(COMMANDS)
+        elif key == "ENTER":
+            return self.execute()
+        elif key.startswith("F") and key[1:].isdigit():
+            self.set_sort(int(key[1:]) - 1)
+        elif key == "TAB":
+            self.set_sort(0 if self.sort_col is None else (self.sort_col + 1) % self.ncols())
+        elif key == "BTAB":
+            self.set_sort((self.ncols() - 1) if self.sort_col is None else (self.sort_col - 1) % self.ncols())
+        elif key == "BACKSPACE":
+            if self.query:
+                self.query = self.query[:-1]
+                self.refilter()
+        elif key == "CTRL_U":
+            self.query = ""
+            self.refilter()
+        elif key == "CTRL_W":
+            words = self.query.split()
+            self.query = " ".join(words[:-1]) + (" " if len(words) > 1 else "")
+            self.refilter()
+        elif key == "ESC":
+            if self.batch and self.batch.running:
+                self.batch.cancel()
+                self.message("Batch ping cancelled")
+            elif self.query:
+                self.query = ""
+                self.refilter()
+        elif key == "CTRL_R":
+            self.load()
+            if not self.load_error:
+                self.message("Switch list reloaded: %d switches" % len(self.devices))
+        elif key == "CTRL_L":
+            self.scr.clear()
+        elif len(key) == 1:
+            self.query += key
+            self.refilter()
+        return None
+
+    def execute(self):
+        command = COMMANDS[self.cmd]
+        if command == "exit":
+            return False
+        if command == "help":
+            return self.show_help()
+        if command == "batch ping":
+            return self.start_batch()
+        dev = self.selected()
+        if dev is None:
+            self.message("No switch selected", error=True)
+            return None
+        if command == "details":
+            return self.show_details(dev)
+        if not valid_host(dev.host):
+            self.message("'%s' has no usable IP/host ('%s')" % (dev.name, dev.host), error=True)
+            return None
+        if command == "ssh":
+            self.connect(dev)
+        elif command == "ping":
+            stream = ProcStream(ping_argv(dev.host, 4, max(2, self.cfg.ping_timeout)))
+            self.show_text("ping %s (%s)" % (dev.name, dev.host), stream=stream)
+            if stream.done and stream.returncode is not None:
+                self.ping[dev.host] = PING_UP if stream.returncode == 0 else PING_DOWN
+        elif command == "traceroute":
+            argv = trace_argv(self.cfg, dev.host)
+            if argv is None:
+                self.message("Neither traceroute nor tracepath is installed", error=True)
+            else:
+                self.show_text("%s %s (%s)" % (os.path.basename(argv[0]), dev.name, dev.host),
+                               stream=ProcStream(argv))
+        return None
+
+    # -- batch ping ---------------------------------------------------------
+
+    def start_batch(self):
+        if self.batch and self.batch.running:
+            self.message("Batch ping is already running (ESC cancels)")
+            return
+        if not which("ping"):
+            self.message("'ping' is not installed", error=True)
+            return
+        hosts, seen = [], set()
+        for d in self.view:
+            if valid_host(d.host) and d.host not in seen:
+                seen.add(d.host)
+                hosts.append(d.host)
+        if not hosts:
+            self.message("No switches to ping", error=True)
+            return
+        self.batch = BatchPing(hosts, self.cfg.ping_workers, self.cfg.ping_timeout, self.ping)
+        self.message("Batch ping started for %d switches" % len(hosts))
+
+    # -- popups -------------------------------------------------------------
+
+    def show_text(self, title, lines=None, stream=None):
+        """Full screen text viewer.  ESC / Enter / q closes; streams are stopped on close."""
+        scr, st = self.scr, self.st
+        offset, follow = 0, stream is not None
+        try:
+            while True:
+                h, w = scr.getmaxyx()
+                content = stream.snapshot() if stream else lines
+                wrapped = wrap_lines(content, w - 2)
+                body_h = max(1, h - 3)
+                max_off = max(0, len(wrapped) - body_h)
+                if follow:
+                    offset = max_off
+                offset = max(0, min(offset, max_off))
+                scr.erase()
+                put(scr, 0, 0, (" " + title + " ").center(w), st.title)
+                hint = " ESC / Enter: close    Up/Down/PgUp/PgDn: scroll"
+                if stream and not stream.done:
+                    hint += "    [running - ESC stops]"
+                put(scr, 1, 0, hint, st.dim)
+                for i, line in enumerate(wrapped[offset:offset + body_h]):
+                    put(scr, 2 + i, 1, line)
+                if len(wrapped) > body_h:
+                    pos = " lines %d-%d of %d " % (offset + 1, min(len(wrapped), offset + body_h), len(wrapped))
+                    put(scr, h - 1, max(0, w - len(pos) - 1), pos, st.status)
+                scr.refresh()
+                key = read_key(scr, 150)
+                if key in ("ESC", "ENTER", "q", "Q"):
+                    break
+                elif key == "UP":
+                    offset, follow = offset - 1, False
+                elif key == "DOWN":
+                    offset += 1
+                    follow = stream is not None and offset >= max_off
+                elif key == "PGUP":
+                    offset, follow = offset - body_h, False
+                elif key in ("PGDN", " "):
+                    offset += body_h
+                    follow = stream is not None and offset >= max_off
+                elif key == "HOME":
+                    offset, follow = 0, False
+                elif key == "END":
+                    offset, follow = max_off, stream is not None
+                elif key == "RESIZE":
+                    self.sync_size()
+        finally:
+            if stream:
+                stream.stop()
+
+    def show_details(self, dev):
+        keys = list(dev.values.keys()) + [PING_LABEL]
+        width = max(len(k) for k in keys)
+        lines = ["%s : %s" % (k.ljust(width), v) for k, v in dev.values.items()]
+        lines.append("%s : %s" % (PING_LABEL.ljust(width), self.ping.get(dev.host, "not checked")))
+        self.show_text("details %s" % dev.name, lines=lines)
+
+    def show_help(self):
+        log = ("on, " + self.cfg.log_dir) if self.cfg.session_log else "off (start with --log to record)"
+        lines = BANNER + [
+            "",
+            "  %s  v%s" % (TITLE, VERSION),
+            "",
+            "  Main screen",
+            "    Up/Down PgUp/PgDn Home/End   select a switch",
+            "    Left/Right                   select a command",
+            "    Enter                        run the selected command",
+            "    just type                    search - several words must all match",
+            "    Backspace / Ctrl-U / ESC     edit / clear the search",
+            "    F1..F%-2d or Tab / Shift-Tab   sort by column (same key again = reverse)" % self.ncols(),
+            "    Ctrl-R                       reload the switch list",
+            "    Ctrl-C                       quit",
+            "",
+            "  Commands",
+            "    ssh          connect - user/password are asked once and kept in memory",
+            "                 only until TRee-Li exits. Log out of the switch to come back.",
+            "    ping         ping the selected switch",
+            "    traceroute   trace the path (traceroute, or tracepath if not installed)",
+            "    batch ping   ping every switch in the current (filtered) list -> Ping column",
+            "    details      show all fields of the selected switch",
+            "    help         this screen",
+            "    exit         quit TRee-Li and forget the credentials",
+            "",
+            "  Inside an ssh session",
+            "    ~.           (at the start of a line) force-disconnect a hanging session",
+            "",
+            "  Switch list    %s  (%d switches)" % (self.cfg.data, len(self.devices)),
+            "  Config files   %s" % (", ".join(self.cfg.files) or "none (defaults)"),
+            "  Session log    %s" % log,
+            "",
+            "  Inspired by V-Li: Switch Manager (Franz, 2025).",
+        ]
+        self.show_text("help", lines=lines)
+
+    # -- credentials --------------------------------------------------------
+
+    def credential_dialog(self, error=None):
+        """Ask user + password.  Returns (user, password or None) or None on ESC."""
+        user, pw = self.last_user or "", ""
+        field = 1 if user else 0
+        scr, st = self.scr, self.st
+        try:
+            while True:
+                self.draw(refresh=False)
+                h, w = scr.getmaxyx()
+                bw, bh = min(66, w - 2), 12
+                y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+                fw = max(4, bw - 15)
+                lines = [
+                    ("Login - asked once per TRee-Li session", curses.A_BOLD),
+                    ("", 0),
+                    None, None,
+                    ("", 0),
+                    (error or "", st.error),
+                    ("Kept in memory only, forgotten when TRee-Li exits.", 0),
+                    ("Empty password: ssh asks at every login instead.", st.dim),
+                    ("Enter: OK   Tab: next field   ESC: cancel", st.dim),
+                ]
+                put(scr, y0, x0, "+" + "-" * (bw - 2) + "+")
+                for i in range(1, bh - 1):
+                    put(scr, y0 + i, x0, "|" + " " * (bw - 2) + "|")
+                put(scr, y0 + bh - 1, x0, "+" + "-" * (bw - 2) + "+")
+                for i, item in enumerate(lines):
+                    if item:
+                        put(scr, y0 + 1 + i, x0 + 2, item[0][:bw - 4], item[1])
+                values = [user, "*" * len(pw)]
+                for i, label in enumerate(("Username:", "Password:")):
+                    y = y0 + 3 + i
+                    put(scr, y, x0 + 2, label, curses.A_BOLD if field == i else 0)
+                    put(scr, y, x0 + 13, fit(values[i][-(fw - 1):], fw), curses.A_UNDERLINE)
+                cy = y0 + 3 + field
+                cx = x0 + 13 + min(len(values[field]), fw - 1)
+                self.set_cursor(True)
+                try:
+                    scr.move(cy, cx)
+                except curses.error:
+                    pass
+                scr.refresh()
+
+                key = read_key(scr, -1)
+                if key is None:
+                    continue
+                if key == "ESC":
+                    return None
+                if key in ("TAB", "BTAB", "UP", "DOWN"):
+                    field = 1 - field
+                elif key == "ENTER":
+                    if field == 0:
+                        field = 1
+                        continue
+                    if not valid_user(user):
+                        error, field = "Please enter a valid username.", 0
+                        continue
+                    self.last_user = user
+                    return user, (pw or None)
+                elif key == "BACKSPACE":
+                    if field == 0:
+                        user = user[:-1]
+                    else:
+                        pw = pw[:-1]
+                elif key == "CTRL_U":
+                    if field == 0:
+                        user = ""
+                    else:
+                        pw = ""
+                elif key == "RESIZE":
+                    self.sync_size()
+                elif len(key) == 1:
+                    if field == 0:
+                        user += key
+                    else:
+                        pw += key
+        finally:
+            self.set_cursor(False)
+
+    # -- ssh ----------------------------------------------------------------
+
+    def connect(self, dev):
+        error = None
+        while True:
+            if self.creds is None:
+                creds = self.credential_dialog(error)
+                if creds is None:
+                    self.message("ssh cancelled")
+                    return
+                self.creds = creds
+            user, password = self.creds
+            result = self.run_ssh(dev, user, password)
+            if result.auth_failed:
+                self.creds = None             # wipe the wrong password, ask again
+                error = "Login failed for '%s' on %s - please re-enter." % (user, dev.name)
+                continue
+            if result.hostkey_changed:
+                self.message("%s: host key changed - not connected" % dev.name, error=True, seconds=15)
+            elif not result.failed:
+                self.message("Disconnected from %s" % dev.name)
+            else:
+                text = "%s: ssh exit code %d" % (dev.name, result.exit_code)
+                if result.last_line:
+                    text += " - " + result.last_line
+                self.message(text, error=True, seconds=10)
+            return
+
+    def open_log(self, dev, user):
+        try:
+            os.makedirs(self.cfg.log_dir, mode=0o700, exist_ok=True)
+            name = re.sub(r"[^A-Za-z0-9_.-]", "_", dev.name or dev.host)[:60]
+            path = os.path.join(self.cfg.log_dir, "%s_%s.log" % (time.strftime("%Y%m%d-%H%M%S"), name))
+            f = os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "ab")
+            f.write(("# TRee-Li session log: %s (%s) as %s, %s\n"
+                     % (dev.name, dev.host, user, time.strftime("%Y-%m-%d %H:%M:%S"))).encode("utf-8"))
+            return f
+        except OSError as e:
+            os.write(sys.stdout.fileno(), ("[TRee-Li] cannot write session log: %s\r\n" % e).encode())
+            return None
+
+    def run_ssh(self, dev, user, password):
+        out = sys.stdout.fileno()
+        key_removed = False
+        curses.endwin()
+        try:
+            while True:
+                argv = build_ssh_argv(self.cfg, user, dev.host, inject_password=bool(password))
+                os.write(out, ("\r\n[TRee-Li] Connecting to %s (%s) as %s ...  "
+                               "(log out to return, ~. to force-disconnect)\r\n"
+                               % (dev.name, dev.host, user)).encode("utf-8", "replace"))
+                log = self.open_log(dev, user) if self.cfg.session_log else None
+                try:
+                    result = run_session(argv, password, log)
+                finally:
+                    if log is not None:
+                        log.close()
+                if result.hostkey_changed and not result.auth_failed:
+                    known_hosts = result.known_hosts or os.path.join(os.path.expanduser("~"), ".ssh", "known_hosts")
+                    if key_removed:
+                        terminal_wait_key("\r\n[TRee-Li] The host key is still reported as changed - "
+                                          "please check %s by hand.\r\n          Press any key to return to "
+                                          "TRee-Li ..." % known_hosts)
+                        return result
+                    answer = terminal_wait_key(
+                        "\r\n[TRee-Li] The host key of %s (%s) has CHANGED.\r\n"
+                        "          Expected if the switch was replaced - otherwise do NOT continue.\r\n"
+                        "          Remove the old key from %s and connect again? [y/N] "
+                        % (dev.name, dev.host, known_hosts))
+                    if answer not in (b"y", b"Y"):
+                        return result
+                    ok, text = remove_host_key(dev.host, known_hosts)
+                    os.write(out, (text.replace("\n", "\r\n") + "\r\n").encode("utf-8", "replace"))
+                    if not ok:
+                        terminal_wait_key("[TRee-Li] Could not remove the old key. "
+                                          "Press any key to return to TRee-Li ...")
+                        return result
+                    key_removed = True
+                    continue
+                if result.failed and not result.auth_failed:
+                    terminal_wait_key("\r\n[TRee-Li] Connection to %s ended (exit code %d). "
+                                      "Press any key to return to TRee-Li ..." % (dev.name, result.exit_code))
+                return result
+        finally:
+            self.resume_curses()
+
+    def resume_curses(self):
+        self.scr.keypad(True)
+        curses.flushinp()
+        self.sync_size()
+        self.scr.refresh()
+        self.set_cursor(False)
+
+
+# --------------------------------------------------------------------------
+# Entry points
+# --------------------------------------------------------------------------
+
+def check(cfg):
+    """--check: validate config and switch list without starting the UI."""
+    ok = True
+    print("%s v%s" % (TITLE, VERSION))
+    print("config files : %s" % (", ".join(cfg.files) or "none (defaults)"))
+    print("switch list  : %s" % cfg.data)
+    try:
+        headers, rows = read_table(cfg.data, cfg.delimiter)
+        devices, columns, warns = build_devices(headers, rows, cfg)
+        print("switches     : %d" % len(devices))
+        print("columns      : %s" % ", ".join("%s (%s)" % c for c in columns))
+        bad = [d for d in devices if not valid_host(d.host)]
+        for d in bad[:10]:
+            print("  warning: '%s' has no usable IP/host ('%s')" % (d.name, d.host))
+        if len(bad) > 10:
+            print("  ... and %d more without usable IP/host" % (len(bad) - 10))
+        for w in warns:
+            print("  warning: %s" % w)
+    except DataError as e:
+        print("  ERROR: %s" % e)
+        ok = False
+    for name, path in (("ssh", which(cfg.ssh_command[0])), ("ping", which("ping"))):
+        print("%-13s: %s" % (name, path or "NOT FOUND"))
+        ok = ok and path is not None
+    trace = trace_argv(cfg, "x")
+    print("traceroute   : %s" % (" ".join(trace[:-1]) if trace else "NOT FOUND (traceroute/tracepath)"))
+    print("session log  : %s" % (cfg.log_dir if cfg.session_log else "off"))
+    return 0 if ok else 1
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="tree-li", description=TITLE + " - connect to your switches over SSH.")
+    parser.add_argument("--data", metavar="CSV", help="switch list (default: 'data' in tree-li.conf, else data.csv next to tree-li)")
+    parser.add_argument("--config", metavar="FILE", help="additional config file")
+    parser.add_argument("--user", help="pre-fill the ssh username (default: your Linux user)")
+    parser.add_argument("--log", action="store_true", help="record ssh sessions to log files")
+    parser.add_argument("--check", action="store_true", help="check config and switch list, then exit")
+    parser.add_argument("--version", action="version", version="%(prog)s " + VERSION)
+    args = parser.parse_args(argv)
+
+    try:
+        cfg = load_config(args)
+    except ConfigError as e:
+        print("tree-li: config error: %s" % e, file=sys.stderr)
+        return 2
+    if args.check:
+        return check(cfg)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("tree-li: must be run in an interactive terminal", file=sys.stderr)
+        return 2
+
+    os.environ.setdefault("ESCDELAY", "50")       # before initscr: fast ESC key
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(143))
+    try:
+        curses.wrapper(lambda scr: App(scr, cfg).run())
+    except KeyboardInterrupt:
+        pass
+    except curses.error as e:
+        print("tree-li: terminal error: %s (TERM=%s)" % (e, os.environ.get("TERM", "")), file=sys.stderr)
+        return 1
+    print("TRee-Li closed - credentials forgotten.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
