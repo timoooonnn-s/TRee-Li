@@ -131,3 +131,8 @@ The command is `tree-li` (`tree` already exists on Linux, so the hyphenated name
 - The **SSH column stays**, now passive: it records the outcome of your **real** ssh attempts (`ok` / `failed`, the reason in details, saved with time). Zero extra traffic. `ssh:failed` search, sortable, exported.
 - **Batch ping (ICMP only)** is rate-limited: at most `ping_rate` (20) pings started per second, replacing `ping_workers`. 700 switches take about 35 s (before: about 2 s at about 320/s). Cancel restores earlier results, including pings that were waiting for their slot.
 - The removed settings are listed in `OBSOLETE`, so old config files keep working.
+
+## D21: Process hardening + credit (2026-10-03)
+- From the handover security review, the parts that apply to TRee-Li as it is: **no core dumps** (`RLIMIT_CORE=0`), and on Linux **`PR_SET_DUMPABLE=0`**, so other processes of the same user can't attach or read `/proc/<pid>/mem`, where the stored password lives. Root still can. ssh and ping children are unaffected, because exec resets this.
+- The **tmux pane feature is NOT built.** It's parked in `council/ideas/tmux-panes.md` with option 1, the hardening and the Warden's concern about forgotten background sessions.
+- Credit **"by Timmy & Ruffy"**: small, in Steel, bottom right of the footer (when no batch progress is shown there) and on the help screen.

@@ -8,6 +8,8 @@
   |_|  |_| \_\ \___| \___|       |_____||_|
 ```
 
+*by Timmy & Ruffy*
+
 Search your switch list, ssh into a switch, log out, and you're back in the list,
 all inside the terminal of a Linux server you reach over SSH (PuTTY, Tabby, ...).
 
@@ -314,6 +316,10 @@ The password and the session itself are never in it.
 
 - **Memory only.** The password lives only in the memory of the running TRee-Li. It never goes to disk,
   command lines or environment variables, so it isn't visible in `ps`.
+- **Memory protected:**
+  - TRee-Li switches off crash dumps for itself, so a crash can't write the password to a file.
+  - On Linux it also marks itself "not dumpable", so other programs of your own user can't attach to it or read its memory.
+  - root still can, as with every program.
 - **Typed once, only at a real prompt.** TRee-Li types it once per connection, only at a real password prompt,
   and never at an SSH-key passphrase prompt.
 - **Wrong password:** ssh is stopped right away instead of retrying, the stored password is wiped,

@@ -34,12 +34,8 @@
 - [ ] PuTTY (F-keys, colours, Unicode lines, mouse + Shift-select) and Tabby: not tested yet
 - [ ] Batch ping + SSH check over all ~700 switches: waiting for the full inventory
 
-## Backlog (brainstorm, not yet chosen)
-- #3 tmux: ssh in new tmux windows (needs a private password hand-over socket)
-- #5 wrong-IP warning (prompt hostname vs CSV name)
-- #6/#7 run show commands on many switches / config backup (read-only by default)
-- #8 LLDP neighbours, #9 live monitor, #10 idle password timeout, #11 personal connection log
-- Tree view by site, mouse support, copy IP, CSV export
+## Ideas
+All open ideas, including the parked tmux pane feature: [ideas/README.md](ideas/README.md).
 
 ## Backlog (only if asked)
 - Extra CSV columns (location, ...): configure `columns`, no code change needed
