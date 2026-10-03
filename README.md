@@ -220,6 +220,20 @@ The file uses the switch list's delimiter, opens directly in Excel, and is reada
 
 TRee-Li also says so at startup when the list has warnings.
 
+It reports obsolete options from an older `tree-li.conf` too (they are ignored, not applied).
+
+**Exit codes**, so you can run it from cron or a pipeline:
+
+| Code | Meaning |
+|---|---|
+| `0` | everything fine |
+| `1` | the switch list has warnings (duplicates, bad addresses, shifted columns) |
+| `2` | cannot run: switch list missing or unreadable, or `ssh` / `ping` not installed |
+
+```bash
+./tree-li --check || echo "please fix the switch list"
+```
+
 ## Switch list (`data.csv`)
 
 ```csv
@@ -252,6 +266,8 @@ TRee-Li reads these files in order, and later ones win:
 | `--check` | check config, switch list ([data check](#data-check)) and required tools, then exit |
 | `--version` | show the version |
 
+`--debug` writes to `debug.log` in the state directory; `tree-li --check` prints that path.
+
 ## Team setup
 
 No system-wide install is needed. Put the TRee-Li directory where your colleagues can read it, e.g.
@@ -265,6 +281,10 @@ To move TRee-Li without git, e.g. as a mail attachment, pack it into one plain-t
 ```bash
 python3 tools/make-bundle.py          # creates dist/tree-li-bundle-<version>.py
 ```
+
+**Bump `VERSION` in `tree-li` before building a bundle whose contents changed.** The version is part of
+the file name, so two different bundles must never share one. `make-bundle.py` refuses to overwrite an
+existing bundle that has different contents and tells you to bump; `--force` overrides that.
 
 On the server, copy the bundle into the folder you want to update and run it there:
 
@@ -284,6 +304,8 @@ git status                         # if it's a git checkout: review, commit, pus
 - **Removed files:** files that a newer version no longer has are removed, but only files a bundle installed
   (they're listed in `.tree-li-files`).
 - **Never touched:** `.git`, `data.csv`, `tree-li.conf` and your own files.
+- **No accidental downgrade:** if the folder already holds a newer TRee-Li, the bundle says so and asks before
+  installing the older one.
 - **Not committed by accident:** the bundle file and `.tree-li-files` are in `.gitignore`.
 
 ## Session logging
@@ -321,7 +343,8 @@ The password and the session itself are never in it.
   - On Linux it also marks itself "not dumpable", so other programs of your own user can't attach to it or read its memory.
   - root still can, as with every program.
 - **Typed once, only at a real prompt.** TRee-Li types it once per connection, only at a real password prompt,
-  and never at an SSH-key passphrase prompt.
+  and never at an SSH-key passphrase prompt. If it does not recognise the switch's prompt it types **nothing**
+  and says so afterwards, so you always know whether the auto-login fired.
 - **Wrong password:** ssh is stopped right away instead of retrying, the stored password is wiped,
   and you're asked again. This protects a central (TACACS+/RADIUS) account from lockouts.
 - **Once you type in a session,** TRee-Li stops watching. A later `Password:` prompt on the switch is never answered for you.
@@ -339,6 +362,7 @@ The password and the session itself are never in it.
 | Lines or symbols look like `â”€` or `?` | `--ascii` / `charset = ascii`, or PuTTY *Window → Translation* → UTF-8 |
 | Only a few colours in PuTTY | PuTTY *Connection → Data → Terminal-type string* → `xterm-256color` |
 | F-keys don't sort | Click the column header |
+| TRee-Li says *"no password prompt recognised"* | The switch words its prompt differently, so you have to type the password yourself. Run `tree-li --debug`, connect again, and send the "before login" part of the [debug log](#debug-log) — the prompt pattern can then be adjusted |
 | Login works with plain ssh but not in TRee-Li | Start with `tree-li --debug`, try again, and look at the [debug log](#debug-log) |
 | Screen garbled | `Ctrl-L` |
 | Can't select text with the mouse | Hold **Shift** while selecting, or set `mouse = no` |

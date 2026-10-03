@@ -124,6 +124,27 @@ class SessionTest(unittest.TestCase):
         self.assertTrue(r.password_sent)
         self.assertFalse(r.auth_failed)
 
+    def test_prompt_not_recognised_is_reported(self):
+        """A stored password that never gets typed must be visible, not silent."""
+        r, _ = self.session("10.99.0.1", "secret", [("FAKE-SW:1>", "exit\r")])
+        self.assertFalse(r.prompt_missed)                  # normal case: the prompt was found
+        result = tl.SessionResult()
+        result.wanted_password, result.password_sent = True, False
+        result.user_typed, result.exit_code = True, 255        # logged in by hand, then logged out
+        self.assertTrue(result.prompt_missed)
+        result.password_sent = True                            # TRee-Li did type it
+        self.assertFalse(result.prompt_missed)
+        result.password_sent, result.user_typed, result.exit_code = False, False, 255
+        self.assertFalse(result.prompt_missed)                 # dead host: no prompt could appear
+
+    def test_manual_login_logout_is_not_a_failure(self):
+        """Prompt missed, user types the password by hand, switch exits 255 on logout."""
+        r, _ = self.session("10.99.0.1", None, [("password: ", "secret\r"), ("FAKE-SW:1>", "exit\r")],
+                            one_try=False)
+        self.assertTrue(r.user_typed)
+        self.assertEqual(r.exit_code, 255)
+        self.assertFalse(r.failed)                         # a normal logout, not an error
+
     def test_without_stored_password_user_types_it(self):
         r, _ = self.session("10.99.0.1", None, [("password: ", "secret\r"), ("FAKE-SW:1>", "exit\r")], one_try=False)
         self.assertFalse(r.password_sent)

@@ -2,6 +2,10 @@
 """Pack TRee-Li into ONE self-extracting text file, e.g. to send it by mail.
 
     python3 tools/make-bundle.py            ->  dist/tree-li-bundle-<version>.py
+    python3 tools/make-bundle.py --force    ->  rebuild even if that version exists already
+
+The file name carries VERSION from tree-li, so bump VERSION before building a bundle
+whose contents changed - otherwise two different bundles would share one file name.
 
 On the target machine:
 
@@ -23,6 +27,7 @@ import io
 import os
 import re
 import subprocess
+import sys
 import tarfile
 import time
 
@@ -45,9 +50,10 @@ EXTRACTOR = r'''#!/usr/bin/env python3
 Files a newer version no longer has are removed - but only files a bundle installed
 (listed in .tree-li-files).  .git, data.csv, tree-li.conf and your own files are never touched.
 """
-import base64, hashlib, io, os, sys, tarfile
+import base64, hashlib, io, os, re, sys, tarfile
 
 SHA256 = "%(sha256)s"
+VERSION = "%(version)s"
 MANIFEST = ".tree-li-files"
 PAYLOAD = """
 %(payload)s
@@ -58,12 +64,21 @@ def safe(name):
     return name and not name.startswith("/") and ".." not in name.split("/") and name != MANIFEST
 
 
-def is_tree_li(folder):
+def installed_version(folder):
+    """VERSION of the tree-li already in that folder, or None if there is none."""
     try:
         with open(os.path.join(folder, "tree-li"), encoding="utf-8", errors="replace") as f:
-            return "TRee-Li" in f.read(4096)
+            head = f.read(4096)
     except OSError:
-        return False
+        return None
+    if "TRee-Li" not in head:
+        return None
+    m = re.search(r'^VERSION = "([^"]+)"', head, re.M)
+    return m.group(1) if m else "?"
+
+
+def as_numbers(version):
+    return [int(p) if p.isdigit() else 0 for p in re.split(r"[._-]", version or "")]
 
 
 def main(argv):
@@ -81,11 +96,17 @@ def main(argv):
             return
         if len(argv) > 1:
             target = os.path.abspath(argv[1])
-        elif is_tree_li(os.getcwd()):
+        elif installed_version(os.getcwd()):
             target = os.getcwd()            # run inside an existing copy: update it in place
         else:
             target = os.path.abspath("tree-li")
-        print("TRee-Li %(version)s -> %%s\n" %% target)
+        here = installed_version(target)
+        print("TRee-Li %%s -> %%s%%s\n" %% (VERSION, target, "   (replacing %%s)" %% here if here else ""))
+        if here and as_numbers(here) > as_numbers(VERSION):
+            print("  WARNING: %%s is already installed there - this bundle is OLDER (%%s)." %% (here, VERSION))
+            if input("  Install the older version anyway? [y/N] ").strip().lower() != "y":
+                print("  Nothing changed.")
+                return
         try:
             with open(os.path.join(target, MANIFEST), encoding="utf-8") as f:
                 previous = set(line.strip() for line in f if safe(line.strip()))
@@ -165,7 +186,18 @@ def version():
     return m.group(1) if m else "dev"
 
 
+def existing_sha(path):
+    """SHA-256 recorded inside a bundle that is already in dist/, or None."""
+    try:
+        with open(path, encoding="ascii", errors="replace") as f:
+            m = re.search(r'^SHA256 = "([0-9a-f]+)"', f.read(4096), re.M)
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
 def main():
+    force = "--force" in sys.argv
     files = project_files()
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
@@ -190,11 +222,23 @@ def main():
     }
     os.makedirs(os.path.join(ROOT, "dist"), exist_ok=True)
     out = os.path.join(ROOT, "dist", name)
+    digest = hashlib.sha256(raw).hexdigest()
+    old = existing_sha(out)
+    if old == digest:
+        print("%s is already up to date (same contents)." % os.path.relpath(out, ROOT))
+        return 0
+    if old and not force:
+        print("ERROR: dist/%s exists already and has DIFFERENT contents.\n"
+              "       Two bundles must never share a file name - someone would install the wrong one.\n"
+              "       Bump VERSION in tree-li (now %s), then build again.  --force overrides."
+              % (name, ver), file=sys.stderr)
+        return 1
     with open(out, "w", encoding="ascii", newline="\n") as f:
         f.write(text)
     print("%d files -> %s (%d KB)" % (len(files), os.path.relpath(out, ROOT), (len(text) + 1023) // 1024))
-    print("SHA-256 of the contents: %s" % hashlib.sha256(raw).hexdigest())
+    print("SHA-256 of the contents: %s" % digest)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

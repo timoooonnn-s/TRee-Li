@@ -4,6 +4,7 @@ Run from the repository root:  python3 -m unittest discover -s tests -v
 """
 import importlib.machinery
 import importlib.util
+import io
 import os
 import shutil
 import sys
@@ -20,7 +21,7 @@ _loader.exec_module(tl)
 
 
 def args(**kw):
-    base = dict(config=None, data=None, user=None, log=False, check=False, ascii=False)
+    base = dict(config=None, data=None, log=False, debug=False, check=False, ascii=False)
     base.update(kw)
     return types.SimpleNamespace(**base)
 
@@ -95,7 +96,7 @@ class TestCsv(TempDir):
                        "sw6;;no ip\n"
                        "sw7;10.0.0.7;a;b\n")
         report = {}
-        devices, _, _ = tl.build_devices(*tl.read_table(p, None, report), cfg=tl.load_config(args()))
+        devices, _, _ = tl.build_devices(*tl.read_table(p, report), cfg=tl.load_config(args()))
         self.assertEqual(report["lines"], [2, 3, 4, 5, 6, 7, 8])
         issues = "\n".join(tl.data_issues(devices, report["lines"], report["issues"]))
         for expected in ("line 8: 4 fields, the header has 3", "IP 10.0.0.1 is used 2 times",
@@ -192,6 +193,76 @@ class TestSearchSort(unittest.TestCase):
         self.assertEqual([d.name for d in tl.sort_devices(ds, 2, False, [states, {}])], ["b", "a", "c"])
         ssh = {"1": tl.SSH_OK, "3": tl.SSH_FAILED}
         self.assertEqual([d.name for d in tl.sort_devices(ds, 3, False, [states, ssh])], ["c", "a", "b"])
+
+
+class TestHelpPage(TempDir):
+    """The about / help page is data, so it can be checked against the real feature set."""
+
+    def sections(self):
+        cfg = tl.load_config(args())
+        return tl.help_sections(cfg, 7, 42)
+
+    def text(self):
+        return "\n".join(" ".join(e[1:]) for e in self.sections())
+
+    def test_every_command_is_documented(self):
+        keys = [e[1] for e in self.sections() if e[0] == "item"]
+        for command in tl.COMMANDS:
+            self.assertIn(command, keys, "help page does not document the '%s' command" % command)
+
+    def test_no_removed_feature_is_still_advertised(self):
+        text = self.text().lower()
+        for gone in ("ssh check", "traceroute", "tracepath", "shift-tab", "no-answer", "ping + ssh"):
+            self.assertNotIn(gone, text, "help page still mentions the removed '%s'" % gone)
+
+    def test_shows_the_paths_in_use(self):
+        cfg = tl.load_config(args())
+        text = self.text()
+        self.assertIn(cfg.data, text)
+        self.assertIn(cfg.state_dir, text)
+        self.assertIn("42 switches", text)
+
+
+class TestCheck(TempDir):
+    def run_check(self, csv_body, conf=""):
+        data = self.write("sw.csv", csv_body)
+        path = self.write("c.conf", "[tree-li]\ndata = %s\n%s" % (data, conf))
+        cfg = tl.load_config(args(config=path))
+        out = io.StringIO()
+        stdout, sys.stdout = sys.stdout, out
+        try:
+            code = tl.check(cfg)
+        finally:
+            sys.stdout = stdout
+        return code, out.getvalue()
+
+    COLUMNS = "Name;IP;subnet;aliases;comment\n"
+
+    def test_clean_list_exits_zero(self):
+        code, out = self.run_check(self.COLUMNS + "sw1;10.0.0.1;a;b;c\n")
+        self.assertEqual(code, 0)
+        self.assertIn("data check   : ok", out)
+
+    def test_warnings_exit_one_so_cron_can_gate(self):
+        code, out = self.run_check(self.COLUMNS + "sw1;10.0.0.1;a;b;c\nsw2;10.0.0.1;a;b;c\n")
+        self.assertEqual(code, 1)
+        self.assertIn("is used 2 times", out)
+
+    def test_missing_list_exits_two(self):
+        path = self.write("c.conf", "[tree-li]\ndata = %s/nope.csv\n" % self.tmp)
+        cfg = tl.load_config(args(config=path))
+        out = io.StringIO()
+        stdout, sys.stdout = sys.stdout, out
+        try:
+            self.assertEqual(tl.check(cfg), 2)
+        finally:
+            sys.stdout = stdout
+
+    def test_obsolete_options_are_reported(self):
+        code, out = self.run_check(self.COLUMNS + "sw1;10.0.0.1;a;b;c\n", conf="ping_workers = 200\n")
+        self.assertIn("ping_workers", out)
+        self.assertIn("older version", out)
+        self.assertEqual(code, 0)             # a note, not a warning
 
 
 class TestSearchSyntax(unittest.TestCase):
