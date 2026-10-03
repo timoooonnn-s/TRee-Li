@@ -21,8 +21,8 @@ The code side lives in `PALETTE` in `tree-li`. This page is the reference for bo
 | Name | Terminal | Used for |
 |---|---|---|
 | **Highlight Orange** | 214 `#ffaf00` | favourite star `*` |
-| Up | 78 `#5fd787` | `● up`, `● open` |
-| Down | 203 `#ff5f5f` | `● down`, `● closed`, `● no-answer`, errors |
+| Up | 78 `#5fd787` | `● up`, `● ok` |
+| Down | 203 `#ff5f5f` | `● down`, `● failed`, errors |
 | Wait | 179 `#d7af5f` | `● wait`, "running" |
 
 ## Rules
@@ -35,7 +35,7 @@ The code side lives in `PALETTE` in `tree-li`. This page is the reference for bo
   Two columns of margin on the left; blocks are separated by space and thin lines, not boxes.
 - **Dialogs:** the screen behind fades to Fade grey. The window is a Steel panel with a thin
   rounded Mist frame that holds the title (`╭─ Login · subtitle ─╮`). No shadows.
-- **Full-screen views** (ping, traceroute, details, help) reuse the same top bar and footer.
+- **Full-screen views** (ping, details, help) reuse the same top bar and footer.
 - **Symbols:** Unicode only for characters in common Windows terminal fonts:
   `─ │ ╭ ╮ ╰ ╯ ▌ ● › ‹ ▲ ▼ · ← → ↑ ↓ • …`. Every one has an ASCII fallback (`--ascii`).
 - **Text:** short, lower-case labels (`run`, `sort`, `favourite`). Column headers are UPPERCASE.

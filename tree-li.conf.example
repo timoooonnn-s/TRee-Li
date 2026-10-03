@@ -11,20 +11,13 @@
 
 # Switch list. Relative paths are relative to THIS config file
 # (never to the directory you start tree-li from).
-# Can also be set with the TREELI_DATA environment variable or --data.
+# Can also be set with --data.
 #data = data.csv
-
-# CSV delimiter: auto, ';', ',', '|' or tab
-#delimiter = auto
 
 # Columns shown in the table, in this order. "csvheader:Label" renames a column.
 # Header names are matched case-insensitively. Search looks at these columns.
 # Columns not listed here are still shown by "details".
 #columns = Name, IP, subnet, aliases:Alias, comment
-
-# Column with the address used for ssh/ping, and the column used as the name.
-#host_column = IP
-#name_column = Name
 
 # Pre-filled ssh username (default: your Linux user name; can be changed at login).
 #user =
@@ -47,15 +40,10 @@
 # Default: $XDG_STATE_HOME/tree-li or ~/.local/state/tree-li
 #state_dir =
 
-# Batch ping: parallel pings and seconds to wait for each reply.
-#ping_workers = 64
+# Batch ping: at most ping_rate pings are started per second (quiet on purpose:
+# 700 switches take about 35 s), and seconds to wait for each reply.
+#ping_rate = 20
 #ping_timeout = 1
-
-# Batch ping also checks SSH. The port is the one ssh itself would use (ssh_options -p,
-# ~/.ssh/config); ssh_port is only the fallback if that can't be determined.
-# ssh_check_timeout: seconds for the whole check (name lookup, connect, greeting).
-#ssh_port = 22
-#ssh_check_timeout = 3
 
 # Mouse: click to select, double-click to run, wheel to scroll.
 # While on, select text in PuTTY / Tabby with Shift held down.
@@ -64,8 +52,6 @@
 # Where Ctrl-E writes the exported list.
 #export_dir = ~
 
-# "auto" uses traceroute if installed, otherwise tracepath.
-#trace_command = auto
 
 # Screen symbols: auto (Unicode on UTF-8 terminals), unicode, or ascii
 # (use ascii if lines/dots look garbled, e.g. old PuTTY fonts). Also: tree-li --ascii

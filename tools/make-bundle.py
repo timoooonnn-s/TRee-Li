@@ -29,9 +29,10 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Without git, only these project files are shipped.
 ALLOW = re.compile(r"^(tree-li|[^/]+\.md|data\.example\.csv|tree-li\.conf\.example|\.git(ignore|attributes)"
-                   r"|(tests|tools)/[^/]+\.py|council/[^/]+\.md)$")
+                   r"|(tests|tools)/[^/]+\.py)$")
 # Never shipped, even if tracked: site data, local settings, build output, caches.
-EXCLUDE = re.compile(r"(^|/)(data\.csv|tree-li\.conf|dist|\.git|__pycache__|\.DS_Store)(/|$)|\.pyc$|\.log$")
+# council/ holds the design notes of this workspace - it is not part of the deliverable.
+EXCLUDE = re.compile(r"^council/|(^|/)(data\.csv|tree-li\.conf|dist|\.git|__pycache__|\.DS_Store)(/|$)|\.pyc$|\.log$")
 
 EXTRACTOR = r'''#!/usr/bin/env python3
 """TRee-Li %(version)s - self-extracting bundle, created %(created)s.

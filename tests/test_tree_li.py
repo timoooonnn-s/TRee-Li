@@ -30,7 +30,6 @@ class TempDir(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self._env = dict(os.environ)
         os.environ["XDG_CONFIG_HOME"] = os.path.join(self.tmp, "xdg")   # ignore the real user config
-        os.environ.pop("TREELI_DATA", None)
 
     def tearDown(self):
         os.environ.clear()
@@ -111,7 +110,7 @@ class TestCsv(TempDir):
         out = os.path.join(self.tmp, "export.csv")
         tl.export_csv(out, devices, headers, ";", {"ping": {"10.0.0.1": "up"}, "ssh": {}}, {("ping", "10.0.0.1"): 0.0})
         h2, r2 = tl.read_table(out)
-        self.assertEqual(h2, ["Name", "IP", "location", "Ping", "Ping checked", "SSH", "SSH checked"])
+        self.assertEqual(h2, ["Name", "IP", "location", "Ping", "Ping checked", "SSH last try", "SSH tried"])
         self.assertEqual(r2[0]["location"], "Room 1")
         self.assertEqual(r2[0]["Ping"], "up")
         self.assertEqual(os.stat(out).st_mode & 0o777, 0o600)
@@ -127,22 +126,19 @@ class TestConfig(TempDir):
     def test_defaults_resolve_data_next_to_script(self):
         cfg = tl.load_config(args())
         self.assertEqual(cfg.data, os.path.join(tl.SCRIPT_DIR, "data.csv"))
-        self.assertIsNone(cfg.delimiter)
         self.assertFalse(cfg.session_log)
 
     def test_config_file_relative_data_and_overrides(self):
-        conf = self.write("my.conf", "[tree-li]\ndata = lists/sw.csv\ndelimiter = ;\n"
+        conf = self.write("my.conf", "[tree-li]\ndata = lists/sw.csv\ndelimiter = ;\n"     # obsolete: ignored
                           "columns = Name, location:Where\nsession_log = yes\nuser = netadmin\n")
         cfg = tl.load_config(args(config=conf))
         self.assertEqual(cfg.data, os.path.join(self.tmp, "lists", "sw.csv"))
-        self.assertEqual(cfg.delimiter, ";")
         self.assertEqual(cfg.columns, [("Name", "Name"), ("location", "Where")])
         self.assertTrue(cfg.session_log)
         self.assertEqual(cfg.user, "netadmin")
-        self.assertEqual(tl.load_config(args(config=conf, user="other")).user, "other")
 
     def test_unknown_option_and_bad_values(self):
-        for body in ("[tree-li]\ndatta = x\n", "[tree-li]\nping_workers = lots\n",
+        for body in ("[tree-li]\ndatta = x\n", "[tree-li]\nping_rate = lots\n",
                      "[tree-li]\nsession_log = maybe\n", "[other]\n", "[tree-li]\nuser = -oProxyCommand=x\n"):
             conf = self.write("bad.conf", body)
             with self.assertRaises(tl.ConfigError, msg=body):
@@ -184,10 +180,6 @@ class TestSearchSort(unittest.TestCase):
         self.assertEqual(seen, [(2, False), (2, True), (None, False), (2, False)])
         self.assertEqual(tl.next_sort(2, True, 0), (0, False))           # other column: ascending
 
-    def test_tab_cycles_through_off(self):
-        self.assertEqual([tl.cycle_sort(c, 3, 1) for c in (None, 0, 1, 2)], [0, 1, 2, None])
-        self.assertEqual([tl.cycle_sort(c, 3, -1) for c in (None, 0, 2)], [2, None, 1])
-
     def test_sort_off_restores_csv_order(self):
         ds = self.devices([("sw10", "1"), ("sw2", "2"), ("sw1", "3")])
         sorted_once = tl.sort_devices(ds, 0, False, {})
@@ -198,7 +190,7 @@ class TestSearchSort(unittest.TestCase):
         ds = self.devices([("a", "1"), ("b", "2"), ("c", "3")])
         states = {"1": tl.PING_UP, "2": tl.PING_DOWN}
         self.assertEqual([d.name for d in tl.sort_devices(ds, 2, False, [states, {}])], ["b", "a", "c"])
-        ssh = {"1": tl.SSH_OPEN, "3": tl.SSH_CLOSED}
+        ssh = {"1": tl.SSH_OK, "3": tl.SSH_FAILED}
         self.assertEqual([d.name for d in tl.sort_devices(ds, 3, False, [states, ssh])], ["c", "a", "b"])
 
 
@@ -210,8 +202,7 @@ class TestSearchSyntax(unittest.TestCase):
             ("ber-edge-01", "10.0.0.2", "edge", "Edge Berlin", ""),
             ("muc-core-01", "fe80::1", "core", "Core Munich", "Room 9"),
             ("ber-test-01", "10.0.0.4", "edge", "Test", "Lab"))]
-        cfg = types.SimpleNamespace(host_column="IP", name_column="Name",
-                                    columns=[("Name", "Name"), ("IP", "IP"), ("aliases", "Alias")])
+        cfg = types.SimpleNamespace(columns=[("Name", "Name"), ("IP", "IP"), ("aliases", "Alias")])
         self.devices, columns, _ = tl.build_devices(headers, rows, cfg)
         self.fields = dict((h.lower(), h) for h in headers)
         self.fields.update((label.lower(), h) for h, label in columns)
@@ -238,8 +229,8 @@ class TestSearchSyntax(unittest.TestCase):
         self.assertEqual(self.names("ping:down", **ping), ["ber-edge-01"])
         self.assertEqual(self.names("ping:none", **ping), ["muc-core-01", "ber-test-01"])
         self.assertEqual(self.names("-ping:up", **ping), ["ber-edge-01", "muc-core-01", "ber-test-01"])
-        ssh = {"status": {"ssh": {"10.0.0.1": tl.SSH_OPEN, "10.0.0.2": tl.SSH_SILENT}}}
-        self.assertEqual(self.names("ssh:no", **ssh), ["ber-edge-01"])         # "no answer", not "none"
+        ssh = {"status": {"ssh": {"10.0.0.1": tl.SSH_OK, "10.0.0.2": tl.SSH_FAILED}}}
+        self.assertEqual(self.names("ssh:failed", **ssh), ["ber-edge-01"])
         self.assertEqual(self.names("ssh:none", **ssh), ["muc-core-01", "ber-test-01"])
         self.assertEqual(self.names("is:fav", favorites={"ber-test-01"}), ["ber-test-01"])
         self.assertEqual(self.names("is:recent", recent={"muc-core-01": 5}), ["muc-core-01"])
@@ -312,12 +303,12 @@ class TestUserState(TempDir):
 
     def test_check_results_are_saved_and_merged(self):
         d = os.path.join(self.tmp, "state")
-        tl.UserState(d).save_status({"ping": {"10.0.0.1": "up", "10.0.0.2": "wait"}, "ssh": {"10.0.0.1": "closed"}},
+        tl.UserState(d).save_status({"ping": {"10.0.0.1": "up", "10.0.0.2": "wait"}, "ssh": {"10.0.0.1": "failed"}},
                                     {("ping", "10.0.0.1"): 100, ("ssh", "10.0.0.1"): 100})
         tl.UserState(d).save_status({"ping": {"10.0.0.1": "down"}, "ssh": {}}, {("ping", "10.0.0.1"): 50})  # older
         status, checked = tl.UserState(d).load_status()
         self.assertEqual(status["ping"], {"10.0.0.1": "up"})                # "wait" is never saved
-        self.assertEqual(status["ssh"], {"10.0.0.1": "closed"})
+        self.assertEqual(status["ssh"], {"10.0.0.1": "failed"})
         self.assertEqual(checked[("ping", "10.0.0.1")], 100)
 
     def test_unwritable_directory_reports_error(self):

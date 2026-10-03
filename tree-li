@@ -27,7 +27,6 @@ import select
 import shlex
 import shutil
 import signal
-import socket
 import struct
 import subprocess
 import sys
@@ -43,17 +42,16 @@ TITLE = "TRee-Li: Switch Manager"
 SCRIPT_DIR = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
 CONFIG_NAME = "tree-li.conf"
 CONFIG_SECTION = "tree-li"
-COMMANDS = ["ssh", "ping", "traceroute", "batch ping", "details", "help", "exit"]
+COMMANDS = ["ssh", "ping", "batch ping", "details", "help", "exit"]
 
-# Status words are stored, shown and searched as they are (ping:down, ssh:closed).
+# Status words are stored, shown and searched as they are (ping:down, ssh:failed).
 PING_UP, PING_DOWN, WAIT = "up", "down", "wait"
-SSH_OPEN, SSH_CLOSED, SSH_SILENT = "open", "closed", "no-answer"     # one word each: searchable
+SSH_OK, SSH_FAILED = "ok", "failed"     # outcome of your last real ssh attempt (no probing)
 STATUS_LABELS = ["Ping", "SSH"]                         # the two status columns after the CSV columns
-STATUS_WIDTHS = [6, 11]                                 # "* down", "* no-answer"
-CHECKED_STATES = (PING_UP, PING_DOWN, SSH_OPEN, SSH_CLOSED, SSH_SILENT)     # results worth keeping
-STATUS_RANK = {PING_DOWN: 0, SSH_CLOSED: 0, SSH_SILENT: 1, PING_UP: 2, SSH_OPEN: 2, WAIT: 3}
-STATUS_STYLE = {PING_UP: "up", SSH_OPEN: "up", PING_DOWN: "down", SSH_CLOSED: "down",
-                SSH_SILENT: "down", WAIT: "wait"}
+STATUS_WIDTHS = [6, 8]                                  # "* down", "* failed"
+CHECKED_STATES = (PING_UP, PING_DOWN, SSH_OK, SSH_FAILED)          # results worth keeping
+STATUS_RANK = {PING_DOWN: 0, SSH_FAILED: 0, PING_UP: 2, SSH_OK: 2, WAIT: 3}
+STATUS_STYLE = {PING_UP: "up", SSH_OK: "up", PING_DOWN: "down", SSH_FAILED: "down", WAIT: "wait"}
 
 # fork() while batch-ping threads run raises a DeprecationWarning on Python 3.12+.
 # The child execs immediately, so it is safe; the warning would only garble the screen.
@@ -66,10 +64,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 DEFAULTS = {
     "data": "data.csv",
-    "delimiter": "auto",
     "columns": "Name, IP, subnet, aliases:Alias, comment",
-    "host_column": "IP",
-    "name_column": "Name",
     "user": "",
     "ssh_command": "ssh",
     "ssh_options": "",
@@ -77,17 +72,17 @@ DEFAULTS = {
     "session_log": "no",
     "log_dir": "~/.local/state/tree-li/logs",
     "state_dir": "",
-    "ping_workers": "64",
+    "ping_rate": "20",
     "ping_timeout": "1",
-    "ssh_port": "22",
-    "ssh_check_timeout": "3",
-    "trace_command": "auto",
     "charset": "auto",
     "mouse": "yes",
     "export_dir": "~",
 }
 
-DELIMITERS = {"auto": None, "tab": "\t", "\\t": "\t", "semicolon": ";", "comma": ",", "pipe": "|"}
+# Options of older versions: accepted and ignored, so an old tree-li.conf keeps working.
+OBSOLETE = ("trace_command", "delimiter", "host_column", "name_column", "ping_workers", "ssh_port",
+            "ssh_check_timeout")
+
 
 
 class ConfigError(Exception):
@@ -152,7 +147,7 @@ def user_config_path():
 
 def load_config(args):
     """Defaults <- tree-li.conf next to the script <- ~/.config/tree-li/tree-li.conf
-    <- --config FILE <- environment (TREELI_DATA) <- command line."""
+    <- --config FILE <- command line."""
     raw = dict(DEFAULTS)
     data_base = SCRIPT_DIR
     candidates = [os.path.join(SCRIPT_DIR, CONFIG_NAME), user_config_path()]
@@ -175,6 +170,8 @@ def load_config(args):
         if not parser.has_section(CONFIG_SECTION):
             raise ConfigError("%s: missing the [%s] section" % (path, CONFIG_SECTION))
         for key, value in parser.items(CONFIG_SECTION):
+            if key in OBSOLETE:
+                continue
             if key not in DEFAULTS:
                 raise ConfigError("%s: unknown option '%s'" % (path, key))
             raw[key] = value.strip()
@@ -183,25 +180,13 @@ def load_config(args):
         cfg.files.append(path)
 
     data = raw["data"] or DEFAULTS["data"]
-    if os.environ.get("TREELI_DATA"):
-        data, data_base = os.environ["TREELI_DATA"], os.getcwd()
     if args.data:
         data, data_base = args.data, os.getcwd()
     # Relative paths are resolved against the config file / script, never the CWD.
     cfg.data = os.path.normpath(os.path.join(data_base, os.path.expanduser(data)))
 
-    delim = raw["delimiter"]
-    if delim.lower() in DELIMITERS:
-        cfg.delimiter = DELIMITERS[delim.lower()]
-    elif len(delim) == 1:
-        cfg.delimiter = delim
-    else:
-        raise ConfigError("delimiter: use auto, ';', ',', '|' or tab")
-
     cfg.columns = parse_columns(raw["columns"])
-    cfg.host_column = raw["host_column"] or DEFAULTS["host_column"]
-    cfg.name_column = raw["name_column"] or DEFAULTS["name_column"]
-    cfg.user = args.user or raw["user"] or default_user()
+    cfg.user = raw["user"] or default_user()
     if cfg.user and not valid_user(cfg.user):
         raise ConfigError("user: '%s' is not a valid user name" % cfg.user)
     try:
@@ -214,16 +199,14 @@ def load_config(args):
     cfg.log_dir = os.path.abspath(os.path.expanduser(raw["log_dir"]))
     state_home = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
     cfg.state_dir = os.path.abspath(os.path.expanduser(raw["state_dir"] or os.path.join(state_home, "tree-li")))
-    cfg.ping_workers = parse_int(raw["ping_workers"], "ping_workers", 1, 256)
+    cfg.ping_rate = parse_int(raw["ping_rate"], "ping_rate", 1, 100)
     cfg.ping_timeout = parse_int(raw["ping_timeout"], "ping_timeout", 1, 30)
-    cfg.ssh_port = parse_int(raw["ssh_port"], "ssh_port", 1, 65535)
-    cfg.ssh_check_timeout = parse_int(raw["ssh_check_timeout"], "ssh_check_timeout", 1, 30)
-    cfg.trace_command = raw["trace_command"] or "auto"
     charset = "ascii" if args.ascii else (raw["charset"] or "auto").lower()
     if charset not in ("auto", "unicode", "ascii"):
         raise ConfigError("charset: use auto, unicode or ascii")
     cfg.charset_setting = charset
     cfg.mouse = parse_bool(raw["mouse"], "mouse")
+    cfg.debug = getattr(args, "debug", False)
     cfg.export_dir = os.path.abspath(os.path.expanduser(raw["export_dir"] or "~"))
     return cfg
 
@@ -322,15 +305,12 @@ def find_header(headers, wanted):
 def build_devices(headers, rows, cfg):
     """Return (devices, columns, warnings); columns are (header, label) pairs."""
     warns = []
-    host_h = find_header(headers, cfg.host_column)
+    host_h = None
+    for alt in ("ip", "host", "hostname", "address", "ip address"):
+        host_h = host_h or find_header(headers, alt)
     if host_h is None:
-        for alt in ("ip", "host", "hostname", "address", "ip address"):
-            host_h = find_header(headers, alt)
-            if host_h:
-                break
-    if host_h is None:
-        raise DataError("no '%s' column in the switch list (found: %s)" % (cfg.host_column, ", ".join(headers)))
-    name_h = find_header(headers, cfg.name_column) or headers[0]
+        raise DataError("no 'IP' column in the switch list (found: %s)" % ", ".join(headers))
+    name_h = find_header(headers, "name") or headers[0]
 
     columns = []
     for key, label in cfg.columns:
@@ -394,7 +374,7 @@ def export_csv(path, devices, headers, delimiter, status, checked):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8-sig", newline="") as f:     # BOM: Excel opens it right
         writer = csv.writer(f, delimiter=delimiter)
-        writer.writerow(list(headers) + ["Ping", "Ping checked", "SSH", "SSH checked"])
+        writer.writerow(list(headers) + ["Ping", "Ping checked", "SSH last try", "SSH tried"])
         for d in devices:
             writer.writerow([d.values.get(h, "") for h in headers] + [
                 status["ping"].get(d.host, ""), when("ping", d.host),
@@ -490,7 +470,7 @@ def filter_devices(devices, query, fields=None, status=None, favorites=(), recen
          word          fuzzy: the letters in this order in a visible column (bc01 -> ber-core-01)
          'word         exact: part of a visible column
          field:value   part of that CSV column (header or table label), field: = empty
-         ping:down     ping state: up, down, wait, none     ssh:closed  open, closed, no, wait, none
+         ping:down     ping state: up, down, wait, none     ssh:failed  last ssh try: ok, failed, none
          is:fav        favourites         is:recent   switches you connected to
          -term         excludes (exact), e.g. -test  -type:edge  -ping:up
     If found is a dict, it receives device -> (score, {column: positions}) for fuzzy words."""
@@ -658,13 +638,6 @@ def next_sort(sort_col, sort_desc, col):
     return None, False
 
 
-def cycle_sort(sort_col, ncols, step):
-    """Tab / Shift-Tab: through every column, then 'off' (None), then around again."""
-    order = list(range(ncols)) + [None]
-    position = order.index(sort_col) if sort_col in order else len(order) - 1
-    return order[(position + step) % len(order)]
-
-
 def sort_devices(devices, col, desc, status=()):
     """col indexes the visible columns, then the status columns (status = [ping, ssh]
     state dicts; problems sort first).  Empty values always go last."""
@@ -708,16 +681,6 @@ def ping_argv(host, count, timeout):
     return [which("ping") or "ping", "-n", "-c", str(count), "-W", str(wait), host]
 
 
-def trace_argv(cfg, host):
-    if cfg.trace_command == "auto":
-        for cmd in ("traceroute", "tracepath"):
-            path = which(cmd)
-            if path:
-                return [path, "-n", host]
-        return None
-    return shlex.split(cfg.trace_command) + [host]
-
-
 def ping_once(host, timeout):
     try:
         return subprocess.call(ping_argv(host, 1, timeout), stdin=subprocess.DEVNULL,
@@ -727,105 +690,26 @@ def ping_once(host, timeout):
         return False
 
 
-def resolve(host, port, timeout):
-    """getaddrinfo with a time limit - it has none of its own (slow DNS would block)."""
-    result = []
+class BatchPing(object):
+    """Pings many hosts, quietly: at most cfg.ping_rate pings are started per second."""
 
-    def run():
-        try:
-            result.append(socket.getaddrinfo(host, port, type=socket.SOCK_STREAM))
-        except (OSError, UnicodeError):
-            result.append([])
-    t = threading.Thread(target=run)
-    t.daemon = True
-    t.start()
-    t.join(timeout)
-    return result[0] if result else []
-
-
-def _ssh_greeting(conn, deadline):
-    """Wait for the server's "SSH-" line; other lines may come first (RFC 4253 4.2).
-    If the server stays quiet for half the time, greet it first."""
-    data, greeted = b"", False
-    while len(data) < 4096:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            break
-        conn.settimeout(remaining if greeted else remaining / 2)
-        try:
-            chunk = conn.recv(1024)
-        except socket.timeout:
-            if greeted:
-                break
-            conn.sendall(b"SSH-2.0-TRee-Li_check\r\n")
-            greeted = True
-            continue
-        if not chunk:
-            break
-        data += chunk
-        if any(line.startswith(b"SSH-") for line in data.split(b"\n")):
-            return SSH_OPEN
-    return SSH_SILENT
-
-
-def ssh_check(host, port, timeout):
-    """Does an SSH server answer?  Connects and waits for its "SSH-" greeting - no login,
-    no password.  Everything (DNS, connect, greeting) together takes at most timeout
-    seconds.  Returns SSH_OPEN, SSH_CLOSED or SSH_SILENT."""
-    deadline = time.time() + timeout
-    refused = False
-    for family, kind, proto, _, address in resolve(host, port, timeout):
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            break
-        conn = socket.socket(family, kind, proto)
-        try:
-            conn.settimeout(remaining)
-            conn.connect(address)
-            return _ssh_greeting(conn, deadline)
-        except ConnectionRefusedError:
-            refused = True
-        except OSError:
-            pass
-        finally:
-            conn.close()
-    return SSH_CLOSED if refused else SSH_SILENT
-
-
-def ssh_port_for(cfg, host):
-    """The port ssh itself will use (ssh_options -p, ~/.ssh/config Port), asked with
-    `ssh -G`, which only prints the configuration.  Falls back to cfg.ssh_port."""
-    try:
-        out = subprocess.run(list(cfg.ssh_command) + list(cfg.ssh_options) + ["-G", "--", host],
-                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                             timeout=5).stdout
-        m = re.search(rb"^port (\d+)\s*$", out, re.MULTILINE)
-        if m:
-            return int(m.group(1))
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return cfg.ssh_port
-
-
-class BatchCheck(object):
-    """Pings and SSH-checks many hosts with a bounded number of worker threads.
-    kinds: ("ping", "ssh"), or ("ssh",) when ping is not installed."""
-
-    def __init__(self, hosts, cfg, status, checked, kinds=("ping", "ssh")):
-        self.cfg, self.states, self.checked = cfg, status, checked
-        self.tasks = [(h, kind) for h in hosts for kind in kinds]
+    def __init__(self, hosts, cfg, status, checked):
+        self.cfg, self.states, self.checked = cfg, status["ping"], checked
+        self.hosts = hosts
         self.done = 0
         self.counts = {}
         self.cancelled = self.reported = False
         self.previous = {}                       # results from before, restored on cancel
         self._next = 0
+        self._next_start = time.time()
         self._lock = threading.Lock()
-        for host, kind in self.tasks:
-            old = status[kind].get(host)
-            if old in CHECKED_STATES:
-                self.previous[(kind, host)] = old
-            status[kind][host] = WAIT
-        self.threads = [threading.Thread(target=self._work) for _ in range(min(cfg.ping_workers, len(self.tasks)))]
+        for host in hosts:
+            if self.states.get(host) in CHECKED_STATES:
+                self.previous[host] = self.states[host]
+            self.states[host] = WAIT
+        # enough threads to keep the rate while each ping waits up to ping_timeout
+        workers = min(len(hosts), 64, cfg.ping_rate * (cfg.ping_timeout + 1))
+        self.threads = [threading.Thread(target=self._work) for _ in range(workers)]
         for t in self.threads:
             t.daemon = True
             t.start()
@@ -834,17 +718,22 @@ class BatchCheck(object):
         cfg = self.cfg
         while True:
             with self._lock:
-                if self.cancelled or self._next >= len(self.tasks):
+                if self.cancelled or self._next >= len(self.hosts):
                     return
-                host, kind = self.tasks[self._next]
+                host = self.hosts[self._next]
                 self._next += 1
-            if kind == "ping":
-                result = PING_UP if ping_once(host, cfg.ping_timeout) else PING_DOWN
-            else:
-                result = ssh_check(host, ssh_port_for(cfg, host), cfg.ssh_check_timeout)
+                start = max(time.time(), self._next_start)      # the rate limit
+                self._next_start = start + 1.0 / cfg.ping_rate
+            while time.time() < start and not self.cancelled:
+                time.sleep(min(0.1, start - time.time()))
+            if self.cancelled:
+                with self._lock:
+                    self._restore(host)
+                return
+            result = PING_UP if ping_once(host, cfg.ping_timeout) else PING_DOWN
             with self._lock:
-                self.states[kind][host] = result
-                self.checked[(kind, host)] = time.time()
+                self.states[host] = result
+                self.checked[("ping", host)] = time.time()
                 self.counts[result] = self.counts.get(result, 0) + 1
                 self.done += 1
 
@@ -854,23 +743,23 @@ class BatchCheck(object):
 
     @property
     def percent(self):
-        return 100 * self.done // max(1, len(self.tasks))
+        return 100 * self.done // max(1, len(self.hosts))
 
     def summary(self):
-        c = self.counts
-        return "ping %d up, %d down / ssh %d open, %d closed, %d no-answer" % (
-            c.get(PING_UP, 0), c.get(PING_DOWN, 0), c.get(SSH_OPEN, 0), c.get(SSH_CLOSED, 0), c.get(SSH_SILENT, 0))
+        return "%d up, %d down" % (self.counts.get(PING_UP, 0), self.counts.get(PING_DOWN, 0))
+
+    def _restore(self, host):
+        if self.states.get(host) == WAIT:
+            if host in self.previous:
+                self.states[host] = self.previous[host]
+            else:
+                del self.states[host]
 
     def cancel(self):
         with self._lock:
             self.cancelled = True
-            for host, kind in self.tasks[self._next:]:
-                if self.states[kind].get(host) == WAIT:
-                    old = self.previous.get((kind, host))
-                    if old:
-                        self.states[kind][host] = old
-                    else:
-                        del self.states[kind][host]
+            for host in self.hosts[self._next:]:
+                self._restore(host)
 
 
 class ProcStream(object):
@@ -989,6 +878,8 @@ class SessionResult(object):
         self.user_typed = False      # keystrokes after the login (or at all, without auto-login)
         self.known_hosts = None      # file named in ssh's "Offending ... key in FILE:N"
         self.last_line = ""
+        self.events = []             # what happened around the login, for --debug
+        self.pre_login = ""          # output before the user's first keystroke (no secrets)
 
     @property
     def failed(self):
@@ -1118,9 +1009,12 @@ def run_session(argv, password=None, log=None, in_fd=None, out_fd=None):
                     before_input = (before_input + text)[-16384:]
                 if armed:
                     tail = (tail + text)[-1024:]
-                    if is_password_prompt(re.split(r"[\r\n]", tail)[-1]):
+                    last = re.split(r"[\r\n]", tail)[-1]
+                    if is_password_prompt(last):
                         tail = ""
+                        result.events.append("password prompt seen: %r" % last.strip())
                         if result.password_sent:
+                            result.events.append("second password prompt -> wrong password, ssh stopped")
                             result.auth_failed = True
                             armed = False
                             try:
@@ -1130,6 +1024,7 @@ def run_session(argv, password=None, log=None, in_fd=None, out_fd=None):
                         else:
                             _write_all(master, password.encode("utf-8") + b"\r")
                             result.password_sent = True
+                            result.events.append("password typed (once)")
             if in_fd in ready:
                 try:
                     data = os.read(in_fd, 4096)
@@ -1137,6 +1032,9 @@ def run_session(argv, password=None, log=None, in_fd=None, out_fd=None):
                     data = b""
                 if not data:           # our own terminal is gone
                     break
+                if armed:
+                    result.events.append("you typed -> TRee-Li stops watching for prompts" if result.password_sent
+                                         else "you typed before any password prompt -> TRee-Li will not type it")
                 armed = False          # the user took over: never type the password again
                 if result.password_sent or not password:
                     result.user_typed = True
@@ -1172,7 +1070,14 @@ def run_session(argv, password=None, log=None, in_fd=None, out_fd=None):
              .decode("utf-8", "replace").split("\n")]
     lines = [l for l in lines if l]
     result.last_line = lines[-1] if lines else ""
+    result.pre_login = clean_output(before_input)
     return result
+
+
+def clean_output(text):
+    """Terminal output as plain text lines (escape sequences and control characters removed)."""
+    text = ANSI_ESCAPES.sub(b"", text.encode("utf-8", "replace")).decode("utf-8", "replace")
+    return "\n".join(CONTROL_CHARS.sub(" ", line).rstrip() for line in text.split("\n"))
 
 
 def remove_host_key(host, known_hosts):
@@ -1510,7 +1415,8 @@ class App(object):
         self.query = ""
         self.sort_col, self.sort_desc = None, False
         self.ping = {}                 # host -> PING_UP / PING_DOWN / WAIT
-        self.ssh = {}                  # host -> SSH_OPEN / SSH_CLOSED / SSH_SILENT / WAIT
+        self.ssh = {}                  # host -> SSH_OK / SSH_FAILED: your last real ssh attempt
+        self.ssh_reason = {}           # host -> why the last ssh attempt failed (this session)
         self.checked = {}              # (kind, host) -> time of that ping / SSH result
         self.headers, self.delimiter, self.issues = [], ";", []
         self.spans = {"tabs": [], "head": [], "y_tabs": -1, "y_head": -1, "y_body": -1}   # for mouse clicks
@@ -1578,7 +1484,7 @@ class App(object):
         keep = self.selected()
         try:
             report = {}
-            headers, rows = read_table(self.cfg.data, self.cfg.delimiter, report)
+            headers, rows = read_table(self.cfg.data, report=report)
             devices, columns, warns = build_devices(headers, rows, self.cfg)
         except DataError as e:
             self.load_error = str(e)
@@ -1637,7 +1543,7 @@ class App(object):
             self.message("Original order")
 
     def status_changed(self, keep=None):
-        """New ping / SSH results: keep a status sort and ping: / ssh: searches up to date."""
+        """New ping / ssh results: keep a status sort and ping: / ssh: searches up to date."""
         if self.sort_col is not None and self.sort_col >= len(self.columns):
             self.apply_sort(keep)
         elif "ping:" in self.query.lower() or "ssh:" in self.query.lower():
@@ -1656,7 +1562,7 @@ class App(object):
     #
     #  TRee-Li  Switch Manager                          timmy · 2/29 switches   top bar
     # ───────────────────────────────────────────────────────────────────────  rule
-    #   ssh   ping   traceroute   batch ping   details   help   exit            tabs
+    #   ssh   ping   batch ping   details   help   exit                         tabs
     #   ›  ber core                                                              search
     #    NAME          IP           ...                              PING        table head
     #    ────────────────────────────────────────────────────────────────        rule
@@ -1763,7 +1669,7 @@ class App(object):
                 x += len(text)
         put(scr, y_search, x, " ", th.cursor)
         if not self.query:
-            put(scr, y_search, 7, "type to search (fuzzy) %s 'exact  type:core  -test  ssh:closed  is:fav" % sym["sep"],
+            put(scr, y_search, 7, "type to search (fuzzy) %s 'exact  type:core  -test  ping:down  is:fav" % sym["sep"],
                 th.placeholder)
 
         # table head
@@ -1888,8 +1794,6 @@ class App(object):
             return self.execute()
         elif key.startswith("F") and key[1:].isdigit():
             self.set_sort(int(key[1:]) - 1)
-        elif key in ("TAB", "BTAB"):
-            self.set_sort(cycle_sort(self.sort_col, self.ncols(), 1 if key == "TAB" else -1), desc=False)
         elif key == "BACKSPACE":
             if self.query:
                 self.query = self.query[:-1]
@@ -2008,13 +1912,6 @@ class App(object):
                 return None
             self.save_status()
             self.status_changed(dev)
-        elif command == "traceroute":
-            argv = trace_argv(self.cfg, dev.host)
-            if argv is None:
-                self.message("Neither traceroute nor tracepath is installed", error=True)
-            else:
-                self.show_text("%s %s (%s)" % (os.path.basename(argv[0]), dev.name, dev.host),
-                               stream=ProcStream(argv))
         return None
 
     # -- batch ping ---------------------------------------------------------
@@ -2023,7 +1920,9 @@ class App(object):
         if self.batch and self.batch.running and not self.batch.cancelled:
             self.message("Batch ping is already running (ESC with an empty search cancels it)")
             return
-        kinds = ("ping", "ssh") if which("ping") else ("ssh",)
+        if not which("ping"):
+            self.message("'ping' is not installed", error=True)
+            return
         hosts, seen = [], set()
         for d in self.view:
             if valid_host(d.host) and d.host not in seen:
@@ -2032,11 +1931,8 @@ class App(object):
         if not hosts:
             self.message("No switches to ping", error=True)
             return
-        self.batch = BatchCheck(hosts, self.cfg, {"ping": self.ping, "ssh": self.ssh}, self.checked, kinds)
-        if "ping" in kinds:
-            self.message("Batch ping started for %d switches (ping + SSH)" % len(hosts))
-        else:
-            self.message("'ping' is not installed - checking SSH only (%d switches)" % len(hosts), error=True)
+        self.batch = BatchPing(hosts, self.cfg, {"ping": self.ping}, self.checked)
+        self.message("Batch ping started: %d switches, about %d s" % (len(hosts), len(hosts) // self.cfg.ping_rate + 1))
 
     # -- popups -------------------------------------------------------------
 
@@ -2125,7 +2021,9 @@ class App(object):
             return text + ("   (%s)" % time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp)) if stamp else "")
         values = list(dev.values.items()) + [
             ("Ping", result("ping", self.ping)),
-            ("SSH", result("ssh", self.ssh)),
+            ("SSH (last try)", result("ssh", self.ssh) + (
+                "   %s" % self.ssh_reason[dev.host] if self.ssh.get(dev.host) == SSH_FAILED
+                and dev.host in self.ssh_reason else "")),
             ("Favourite", "yes" if device_key(dev) in self.state.favorites else "no"),
             ("Last connected", time.strftime("%Y-%m-%d %H:%M", time.localtime(last)) if last else "never"),
         ]
@@ -2157,7 +2055,6 @@ class App(object):
         item("Ctrl-E", "export the current list to CSV (%s)" % self.cfg.export_dir)
         item("mouse", "click: select, double-click: run, header: sort, wheel: scroll")
         item("F1..F%d" % self.ncols(), "sort by column: press again for reverse, a third time for off")
-        item("Tab  Shift-Tab", "next / previous sort column, then off")
         item("Ctrl-R", "reload the switch list")
         item("Ctrl-C", "quit")
         section("Search")
@@ -2166,14 +2063,13 @@ class App(object):
         item("type:core  responsible:timmy", "a CSV column, also ones not shown in the table")
         item("location:", "column is empty")
         item("-test  -type:edge", "exclude (exact)")
-        item("ping:down  ssh:closed", "state: up/down, open/closed/no-answer, wait, none")
+        item("ping:down  ssh:failed", "ping: up/down/wait, ssh (your last try): ok/failed, none")
         item("is:fav", "your favourites")
         item("is:recent", "switches you connected to, newest first")
         section("Commands")
         item("ssh", "connect - user/password are asked once and kept")
         item("", "in memory only. Log out of the switch to come back.")
         item("ping", "ping the selected switch")
-        item("traceroute", "trace the path (traceroute, or tracepath)")
         item("batch ping", "ping + SSH check of the current list -> Ping / SSH")
         item("details", "all fields of the selected switch")
         item("help", "this screen")
@@ -2298,16 +2194,22 @@ class App(object):
                 error = "Login failed for '%s' on %s - please re-enter." % (user, dev.name)
                 continue
             if result.hostkey_changed:
+                self.ssh_reason[dev.host] = "host key changed - not connected"
                 self.message("%s: host key changed - not connected" % dev.name, error=True, seconds=15)
             elif not result.failed:
                 self.state.touch(device_key(dev))
-                self.refilter(dev)             # is:recent / recent order are up to date at once
                 self.message("Disconnected from %s" % dev.name)
             else:
+                self.ssh_reason[dev.host] = "exit code %d - %s" % (result.exit_code, result.last_line)
                 text = "%s: ssh exit code %d" % (dev.name, result.exit_code)
                 if result.last_line:
                     text += " - " + result.last_line
                 self.message(text, error=True, seconds=10)
+            # the SSH column remembers how your last real attempt went - no extra connections
+            self.set_status("ssh", dev.host, SSH_FAILED if result.failed or result.hostkey_changed else SSH_OK)
+            self.save_status()
+            self.refilter(dev)                 # is:recent, ssh: searches and status sorts up to date
+            self.status_changed(dev)
             return
 
     def note(self, *lines):
@@ -2317,6 +2219,29 @@ class App(object):
             prefix = "\033[1;34m%s\033[0m" % prefix          # bold blue: every colour terminal knows it
         indent = "\r\n" + " " * 10
         return "\r\n%s %s %s" % (prefix, self.th.sym["gt"], indent.join(lines))
+
+    def debug_log(self, dev, argv, password, result):
+        """--debug: append what happened around this login to debug.log (0600).
+        Contains the ssh command, prompts, decisions and the output BEFORE the
+        login - never the password, never the session itself."""
+        lines = [
+            "=== %s  %s (%s)" % (time.strftime("%Y-%m-%d %H:%M:%S"), dev.name, dev.host),
+            "command      : %s" % " ".join(shlex.quote(a) for a in argv),
+            "password     : %s" % ("stored, TRee-Li types it" if password else "none stored, you type it"),
+        ] + ["event        : %s" % e for e in result.events] + [
+            "exit code    : %s   failed: %s   auth failed: %s   host key changed: %s" % (
+                result.exit_code, result.failed, result.auth_failed, result.hostkey_changed),
+            "last line    : %s" % result.last_line,
+            "before login :",
+        ] + ["  | " + line for line in result.pre_login.strip("\n").split("\n")[-40:]] + [""]
+        path = os.path.join(self.cfg.state_dir, "debug.log")
+        try:
+            os.makedirs(self.cfg.state_dir, mode=0o700, exist_ok=True)
+            with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a",
+                           encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except OSError as e:
+            self.message("cannot write %s: %s" % (path, e.strerror or e), error=True, seconds=10)
 
     def open_log(self, dev, user):
         try:
@@ -2348,6 +2273,8 @@ class App(object):
                 finally:
                     if log is not None:
                         log.close()
+                if self.cfg.debug:
+                    self.debug_log(dev, argv, password, result)
                 if result.hostkey_changed and not result.auth_failed:
                     known_hosts = result.known_hosts or os.path.join(os.path.expanduser("~"), ".ssh", "known_hosts")
                     if key_removed:
@@ -2397,7 +2324,7 @@ def check(cfg):
     print("switch list  : %s" % cfg.data)
     try:
         report = {}
-        headers, rows = read_table(cfg.data, cfg.delimiter, report)
+        headers, rows = read_table(cfg.data, report=report)
         devices, columns, warns = build_devices(headers, rows, cfg)
         print("switches     : %d" % len(devices))
         print("columns      : %s" % ", ".join("%s (%s)" % c for c in columns))
@@ -2413,8 +2340,6 @@ def check(cfg):
     for name, path in (("ssh", which(cfg.ssh_command[0])), ("ping", which("ping"))):
         print("%-13s: %s" % (name, path or "NOT FOUND"))
         ok = ok and path is not None
-    trace = trace_argv(cfg, "x")
-    print("traceroute   : %s" % (" ".join(trace[:-1]) if trace else "NOT FOUND (traceroute/tracepath)"))
     print("session log  : %s" % (cfg.log_dir if cfg.session_log else "off"))
     return 0 if ok else 1
 
@@ -2423,8 +2348,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="tree-li", description=TITLE + " - connect to your switches over SSH.")
     parser.add_argument("--data", metavar="CSV", help="switch list (default: 'data' in tree-li.conf, else data.csv next to tree-li)")
     parser.add_argument("--config", metavar="FILE", help="additional config file")
-    parser.add_argument("--user", help="pre-fill the ssh username (default: your Linux user)")
     parser.add_argument("--log", action="store_true", help="record ssh sessions to log files")
+    parser.add_argument("--debug", action="store_true",
+                        help="write what happens around each ssh login to ~/.local/state/tree-li/debug.log")
     parser.add_argument("--ascii", action="store_true", help="plain ASCII screen (if lines/symbols look garbled)")
     parser.add_argument("--check", action="store_true", help="check config and switch list, then exit")
     parser.add_argument("--version", action="version", version="%(prog)s " + VERSION)

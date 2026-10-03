@@ -117,3 +117,17 @@ The command is `tree-li` (`tree` already exists on Linux, so the hyphenated name
   - switched off during ssh sessions
   - *Operator:* text selection then needs Shift; documented in the README troubleshooting table
   - wheel-down needs ncurses mouse v2 (RHEL 8+); older builds only scroll up
+
+## D18: traceroute removed (user, 2026-10-03)
+- The command, `trace_command` and the `--check` line are gone. An old `tree-li.conf` that still sets `trace_command` keeps working: the option is silently ignored (`OBSOLETE`).
+
+## D19: Slimmed down + --debug (user, 2026-10-03)
+- **Removed:** Tab/Shift-Tab sorting (F-keys, ESC and header clicks cover it), `TREELI_DATA`, `--user`, and the `delimiter` / `host_column` / `name_column` settings (auto-detection covers them). Old configs that still set these keep working (`OBSOLETE`).
+- **`--debug`** appends one report per login to `state_dir/debug.log` (0600): the command, the prompts seen, typed/not typed, exit code, last line, and the output before the login. Never the password or the session. Built for field problems like the Universal 4300 case.
+- **Bundle:** `council/` is never shipped. It stays in this workspace only. A checkout that got it from an older bundle loses it on the next update.
+
+## D20: SSH test removed, batch ping made quiet (user, 2026-10-03)
+- The active SSH test is gone: it caused noise that the network monitoring noticed. That removes `ssh_check`, the DNS helper, `ssh -G` port detection, the `ssh_port` / `ssh_check_timeout` settings and their tests.
+- The **SSH column stays**, now passive: it records the outcome of your **real** ssh attempts (`ok` / `failed`, the reason in details, saved with time). Zero extra traffic. `ssh:failed` search, sortable, exported.
+- **Batch ping (ICMP only)** is rate-limited: at most `ping_rate` (20) pings started per second, replacing `ping_workers`. 700 switches take about 35 s (before: about 2 s at about 320/s). Cancel restores earlier results, including pings that were waiting for their slot.
+- The removed settings are listed in `OBSOLETE`, so old config files keep working.

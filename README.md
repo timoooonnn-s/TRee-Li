@@ -28,7 +28,6 @@ TRee-Li keeps its menu, but runs ssh inside your terminal instead of a new deskt
 ### 1. Check the requirements
 
 On the server: Linux, **Python 3.8 or newer** (`python3 --version`), the OpenSSH client and `ping`.
-`traceroute` or `tracepath` is optional.
 
 ### 2. Get TRee-Li
 
@@ -92,6 +91,7 @@ All keys: [Keys](#keys) or the **help** command inside TRee-Li. If something loo
 - [Team setup](#team-setup)
 - [Single-file bundle](#single-file-bundle)
 - [Session logging](#session-logging)
+- [Debug log](#debug-log)
 - [Colours and symbols](#colours-and-symbols)
 - [Security](#security)
 - [Troubleshooting](#troubleshooting)
@@ -103,14 +103,14 @@ All keys: [Keys](#keys) or the **help** command inside TRee-Li. If something loo
   TRee-Li  Switch Manager                                     timmy · 2/29 switches
 ───────────────────────────────────────────────────────────────────────────────────
 
-   ssh   ping   traceroute   batch ping   details   help   exit
+   ssh   ping   batch ping   details   help   exit
 
   ›  ber core
 
     NAME          IP            SUBNET    ALIAS                COMMENT    PING ▲  SSH
     ─────────────────────────────────────────────────────────────────────────────────────────
- ▌* ber-core-01   192.0.2.1     ber       Core switch Berlin   5520       ● down  ● no-answer
-    ber-core-02   192.0.2.7     ber       Core switch Berlin   VSP7400    ● up    ● open
+ ▌* ber-core-01   192.0.2.1     ber       Core switch Berlin   5520       ● down  ● failed
+    ber-core-02   192.0.2.7     ber       Core switch Berlin   VSP7400    ● up    ● ok
 
 ───────────────────────────────────────────────────────────────────────────────────
   Enter run  ←→ command  ^F favourite  F1-F6 sort  ^R reload  ^C quit
@@ -124,7 +124,8 @@ From top to bottom:
   - `▌` marks the selected row.
   - `*` marks a [favourite](#favourites-and-recent-switches).
   - `▲`/`▼` shows the sorted column.
-  - **PING** and **SSH** show the results of the last [batch ping](#commands).
+  - **PING** shows the last ping result. **SSH** shows how your last real ssh attempt went: `ok` or `failed`.
+    TRee-Li never tests SSH on its own, so there's no extra traffic.
   - Letters matching the [search](#search) are underlined.
 - **Footer:** key hints, or a message for a few seconds.
 
@@ -139,14 +140,13 @@ From top to bottom:
 | `Backspace` / `Ctrl-W` / `Ctrl-U` | delete a character / a word / the whole search |
 | `ESC` | step by step: 1. clears the search, 2. cancels a running batch ping, 3. clears the sort |
 | `F1` … `F7` | sort by that column: ▲ ascending → ▼ descending → original order |
-| `Tab` / `Shift-Tab` | next / previous sort column, after the last one: original order |
 | `Ctrl-F` | mark / unmark the selected switch as a [favourite](#favourites-and-recent-switches) |
 | `Ctrl-E` | [export](#export) the current list to a CSV file |
 | `Ctrl-R` | reload the switch list |
 | `Ctrl-L` | redraw the screen |
 | `Ctrl-C` | quit |
 
-In full-screen output (ping, traceroute, details, help): `↑` `↓` `PgUp` `PgDn` scroll, and `ESC` / `Enter` / `q` closes.
+In full-screen output (ping, details, help): `↑` `↓` `PgUp` `PgDn` scroll, and `ESC` / `Enter` / `q` closes.
 
 **Mouse:**
 - **Click:** a row or tab selects it.
@@ -162,8 +162,7 @@ While TRee-Li has the mouse, PuTTY and Tabby select text only with **Shift** hel
 |---|---|
 | **ssh** | Connects to the selected switch. The first time, TRee-Li asks for username and password (see [Security](#security)). Log out to come back; `~.` at the start of a line force-closes a hanging session. |
 | **ping** | `ping -c 4` with live output; also updates the Ping column. |
-| **traceroute** | `traceroute`, or `tracepath` if traceroute isn't installed. |
-| **batch ping** | Checks every switch in the **current, filtered** list in parallel. **PING:** `up` / `down`. **SSH:** `open` (an SSH server answers), `closed` (port refused) or `no-answer`. The SSH check uses the port ssh itself would use (from `ssh_options` / `~/.ssh/config`) and only waits for the server's greeting: no login, no password. Sorting by PING or SSH puts problems first. Results are [kept](#saved-check-results) until the next check. Without `ping` installed, only SSH is checked. |
+| **batch ping** | Pings every switch in the **current, filtered** list and fills the PING column. It's deliberately **quiet**: at most 20 pings per second (`ping_rate`), so 700 switches take about 35 s and one site a few seconds. You can keep working meanwhile; `ESC` (with an empty search) cancels. |
 | **details** | All CSV fields of the switch, plus ping/SSH result with time, favourite and last connection. |
 | **help** | Keys, search syntax, and the file paths in use. |
 | **exit** | Quits and forgets the password. |
@@ -181,11 +180,11 @@ in this order within one visible column. The best matches come first, and the ma
 | `location:` | the column is empty |
 | `-test`, `-type:edge` | excludes matches (always exact) |
 | `ping:down` | ping state: `up`, `down`, `wait`, or `none` (not checked yet) |
-| `ssh:closed`, `ssh:no-answer` | SSH state: `open`, `closed`, `no-answer` (`ssh:no` is enough), `wait`, or `none` |
+| `ssh:failed`, `ssh:ok` | outcome of your last ssh attempt to that switch, or `none` (never tried) |
 | `is:fav` | your favourites |
 | `is:recent` | switches you connected to, newest first |
 
-Example: `type:core -ber ping:up ssh:no` shows core switches outside Berlin that answer ping but not SSH.
+Example: `type:core -ber ping:up ssh:failed` shows core switches outside Berlin that answer ping but where your last ssh attempt failed.
 
 ## Favourites and recent switches
 
@@ -196,7 +195,7 @@ Example: `type:core -ber ping:up ssh:no` shows core switches outside Berlin that
 
 ## Saved check results
 
-The results of the last ping / batch ping (PING, SSH and their time) are saved per user in
+The PING results and your last ssh attempts (SSH), each with its time, are saved per user in
 `~/.local/state/tree-li/status`. After a restart they're shown again until the next check, and **details** shows when
 each one was taken. Several TRee-Li windows merge their results, and the newest one wins.
 
@@ -205,9 +204,9 @@ each one was taken. Several TRee-Li windows merge their results, and the newest 
 `Ctrl-E` writes the **current list** (filter and order as on screen) to `tree-li-export-<date>-<time>.csv`
 in your home directory (`export_dir` in the [configuration](#configuration)). It contains:
 - all CSV columns
-- **Ping** and **SSH** with the time they were checked
+- **Ping** and your last **SSH** attempt, each with its time
 
-Example: search `ssh:no`, press `Ctrl-E`, and you have the list of switches that don't answer SSH.
+Example: search `ping:down`, press `Ctrl-E`, and you have the list of switches that didn't answer.
 The file uses the switch list's delimiter, opens directly in Excel, and is readable only by you.
 
 ## Data check
@@ -244,8 +243,8 @@ TRee-Li reads these files in order, and later ones win:
 
 | Command line | Effect |
 |---|---|
-| `--data CSV` | use another switch list (also: environment variable `TREELI_DATA`) |
-| `--user NAME` | pre-fill the username |
+| `--data CSV` | use another switch list |
+| `--debug` | write what happens around each ssh login to a [debug log](#debug-log) |
 | `--log` | turn on [session logging](#session-logging) |
 | `--ascii` | plain ASCII instead of lines and symbols ([why](#colours-and-symbols)) |
 | `--check` | check config, switch list ([data check](#data-check)) and required tools, then exit |
@@ -292,6 +291,18 @@ Off by default. Turn it on with `--log` or `session_log = yes`. Each ssh session
 The log contains what was on screen, never the password TRee-Li typed. Commands like
 `show running-config` can still put secrets into it.
 
+## Debug log
+
+`tree-li --debug` appends a short report of every ssh login to `~/.local/state/tree-li/debug.log`
+(readable only by you):
+- the ssh command
+- which password prompts TRee-Li saw
+- whether it typed the password
+- exit code and the reason for a failure
+- the switch's output **before** the login (banner, prompts)
+
+The password and the session itself are never in it.
+
 ## Colours and symbols
 
 - **Colours:** shades of blue with small orange/green/red highlights ([STYLE.md](STYLE.md)).
@@ -321,10 +332,10 @@ The log contains what was on screen, never the password TRee-Li typed. Commands 
 | Old switch: `no matching key exchange method` / `host key type` | e.g. `ssh_options = -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa`. On RHEL 9 the system crypto policy may also need to allow SHA-1 |
 | Lines or symbols look like `â”€` or `?` | `--ascii` / `charset = ascii`, or PuTTY *Window → Translation* → UTF-8 |
 | Only a few colours in PuTTY | PuTTY *Connection → Data → Terminal-type string* → `xterm-256color` |
-| F-keys don't sort | `Tab` / `Shift-Tab` |
+| F-keys don't sort | Click the column header |
+| Login works with plain ssh but not in TRee-Li | Start with `tree-li --debug`, try again, and look at the [debug log](#debug-log) |
 | Screen garbled | `Ctrl-L` |
 | Can't select text with the mouse | Hold **Shift** while selecting, or set `mouse = no` |
-| SSH column says `closed` but ssh works | The switch uses another port: put it in `ssh_options` (`-p 2222`) or `~/.ssh/config`. The check reads the port from there |
 | Not sure what's wrong | `tree-li --check` |
 
 ## Development
@@ -335,4 +346,4 @@ python3 -m unittest discover -s tests -v
 
 - `tests/fake_ssh.py` acts as a switch (password `secret`, a changed host key, a timeout).
   Point `ssh_command` at it in a test config.
-- Design rules: [STYLE.md](STYLE.md). Decisions and background: [`council/`](council/).
+- Design rules: [STYLE.md](STYLE.md).
